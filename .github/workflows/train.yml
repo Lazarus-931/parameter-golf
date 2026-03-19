@@ -55,7 +55,8 @@ jobs:
           pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm
           echo "Python: $(python3 --version)"
           echo "MLX: $(python3 -c 'import mlx.core as mx; print(mx.__version__)' 2>/dev/null || echo 'unknown')"
-          python3 -m mlx.launch --help > /dev/null 2>&1 || { echo "ERROR: mlx.launch not available"; exit 1; }
+          # mlx.launch is a CLI script installed by mlx, not a python module
+          which mlx.launch || { echo "ERROR: mlx.launch not found in PATH"; pip show mlx | grep Location; ls -la "$VENV_DIR/bin/mlx"* 2>/dev/null; exit 1; }
 
       - name: Sync code and data to all hosts
         run: |
@@ -169,10 +170,10 @@ jobs:
           DATA_PATH="$HOME/parameter-golf-work/data/datasets/fineweb10B_sp1024" \
           TOKENIZER_PATH="$HOME/parameter-golf-work/data/tokenizers/fineweb_1024_bpe.model" \
           OUT_DIR="$HOME/parameter-golf-work/logs" \
-          python3 -m mlx.launch \
+          mlx.launch \
             --hostfile "$WORK_DIR/hostfile.json" \
             --backend ring \
-            "$WORK_DIR/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+            -- "$VENV_DIR/bin/python3" "$WORK_DIR/train_gpt_mlx.py" 2>&1 | tee train_log.txt
 
       - name: Collect results
         if: always()
