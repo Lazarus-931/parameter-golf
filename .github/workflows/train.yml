@@ -27,14 +27,15 @@ jobs:
     runs-on: [self-hosted, parameter-golf]
     timeout-minutes: 120
 
-    env:
-      WORK_DIR: ~/parameter-golf-work
-      VENV_DIR: ~/parameter-golf-venv
-      DATA_DIR: ~/parameter-golf-data
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set paths
+        run: |
+          echo "WORK_DIR=$HOME/parameter-golf-work" >> $GITHUB_ENV
+          echo "VENV_DIR=$HOME/parameter-golf-venv" >> $GITHUB_ENV
+          echo "DATA_DIR=$HOME/parameter-golf-data" >> $GITHUB_ENV
 
       - name: Ensure venv
         run: |
