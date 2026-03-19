@@ -154,24 +154,36 @@ jobs:
 
           cp cluster/hostfile.json "$PG_WORK/hostfile.json"
 
-          # The training script auto-detects /opt/parameter-golf/work paths.
-          # Use --env to forward training params to all remote hosts.
           RUN_ID="${{ inputs.run_id || github.sha }}"
           ITERATIONS="${{ inputs.iterations || '200' }}"
           BATCH="${{ inputs.train_batch_tokens || '8192' }}"
 
-          mlx.launch \
-            --hostfile "$PG_WORK/hostfile.json" \
-            --backend ring \
-            --verbose \
-            --env "RUN_ID=$RUN_ID" \
-            --env "ITERATIONS=$ITERATIONS" \
-            --env "TRAIN_BATCH_TOKENS=$BATCH" \
-            --env "VAL_LOSS_EVERY=0" \
-            --env "VAL_BATCH_SIZE=8192" \
-            --env "GRAD_ACCUM_STEPS=1" \
-            --env "MLX_MAX_MICROBATCH_TOKENS=4096" \
-            "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+          export RUN_ID ITERATIONS
+          export TRAIN_BATCH_TOKENS="$BATCH"
+          export VAL_LOSS_EVERY=0
+          export VAL_BATCH_SIZE=8192
+          export GRAD_ACCUM_STEPS=1
+          export MLX_MAX_MICROBATCH_TOKENS=4096
+
+          if [ "$NUM_HOSTS" -gt 1 ]; then
+            # Multi-host: use mlx.launch to coordinate distributed training
+            mlx.launch \
+              --hostfile "$PG_WORK/hostfile.json" \
+              --backend ring \
+              --verbose \
+              --env "RUN_ID=$RUN_ID" \
+              --env "ITERATIONS=$ITERATIONS" \
+              --env "TRAIN_BATCH_TOKENS=$BATCH" \
+              --env "VAL_LOSS_EVERY=0" \
+              --env "VAL_BATCH_SIZE=8192" \
+              --env "GRAD_ACCUM_STEPS=1" \
+              --env "MLX_MAX_MICROBATCH_TOKENS=4096" \
+              "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+          else
+            # Single host: run directly, no mlx.launch overhead
+            echo "Single host mode — running directly"
+            python3 "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+          fi
 
       - name: Collect results
         if: always()
