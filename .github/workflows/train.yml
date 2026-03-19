@@ -149,6 +149,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: |
+          set -o pipefail
           source "$PG_VENV/bin/activate"
 
           NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))")
@@ -182,32 +183,29 @@ jobs:
               --env "VAL_BATCH_SIZE=8192" \
               --env "GRAD_ACCUM_STEPS=1" \
               --env "MLX_MAX_MICROBATCH_TOKENS=4096" \
-              "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee "$GITHUB_WORKSPACE/train_log.txt"
+              "$PG_WORK/train_gpt_mlx.py"
           else
             # Single host: run directly, no mlx.launch overhead
             echo "Single host mode — running directly"
-            python3 -u "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee "$GITHUB_WORKSPACE/train_log.txt"
+            python3 -u "$PG_WORK/train_gpt_mlx.py"
           fi
+          echo "Training script exit code: $?"
 
       - name: Collect results
         if: always()
         run: |
-          # Wait for log files to be fully flushed
           sync
-          cp -r /opt/parameter-golf/work/logs/ ./logs/ 2>/dev/null || true
-          echo "=== Last 10 lines of train_log.txt ==="
-          tail -10 train_log.txt 2>/dev/null || echo "No train_log.txt"
-          echo "=== Last 10 lines of run log ==="
-          tail -10 ./logs/*.txt 2>/dev/null || echo "No run log"
+          cp -r "$PG_WORK/logs/" ./logs/ 2>/dev/null || true
+          # Show last 20 lines of run log to confirm val_bpb was captured
+          echo "=== Last 20 lines of run log ==="
+          tail -20 ./logs/*.txt 2>/dev/null || echo "No run log found"
 
       - name: Upload training log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: train-log-distributed-${{ github.sha }}
-          path: |
-            train_log.txt
-            logs/
+          name: train-log-${{ github.sha }}
+          path: logs/
 
       - name: Print summary
         if: always()
@@ -215,7 +213,9 @@ jobs:
           NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))" 2>/dev/null || echo "?")
           echo "## Distributed Training Results ($NUM_HOSTS hosts)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -30 train_log.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No log output" >> $GITHUB_STEP_SUMMARY
+          # Show final results from the script's log file
+          grep -E "step:.*val_|final_|saved_|serialized_|stopping" ./logs/*.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          tail -5 ./logs/*.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No log output" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Cleanup training artifacts
