@@ -170,10 +170,13 @@ jobs:
           DATA_PATH="$HOME/parameter-golf-work/data/datasets/fineweb10B_sp1024" \
           TOKENIZER_PATH="$HOME/parameter-golf-work/data/tokenizers/fineweb_1024_bpe.model" \
           OUT_DIR="$HOME/parameter-golf-work/logs" \
+          # mlx.launch SSHes to each host and runs: <python> <script>
+          # Use the venv python path that exists on each Mini at ~/parameter-golf-venv
           mlx.launch \
             --hostfile "$WORK_DIR/hostfile.json" \
             --backend ring \
-            -- "$VENV_DIR/bin/python3" "$WORK_DIR/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+            --verbose \
+            -- ~/parameter-golf-venv/bin/python3 ~/parameter-golf-work/train_gpt_mlx.py 2>&1 | tee train_log.txt
 
       - name: Collect results
         if: always()
