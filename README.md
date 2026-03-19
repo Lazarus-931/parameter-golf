@@ -189,10 +189,7 @@ Results from our self-hosted CI/CD pipeline running on Mac Minis (M4, 16GB) conn
 
 **Config:** `TRAIN_BATCH_TOKENS=8192`, `GRAD_ACCUM_STEPS=1`, `MLX_MAX_MICROBATCH_TOKENS=4096`, `VAL_LOSS_EVERY=0`, 17M param model (9 layers, 512 dim, 1024 vocab)
 
-**Takeaways:**
-- Single Mini mode is ~6x faster per step than 2-Mini distributed due to Tailscale network overhead dominating the small batch size
-- The distributed ring backend (`mlx.launch`) works but is only worthwhile with larger batch sizes or faster interconnects
-- Training runs automatically on push via GitHub Actions self-hosted runners
+
 
 ## Support
 

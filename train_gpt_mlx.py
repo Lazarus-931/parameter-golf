@@ -528,18 +528,18 @@ class Muon:
             out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
         return out
 
-class NorMuon(optim):
-    # NorMuon: https://github.com/zichongli5/modded-nanogpt/blob/fe96141e7c3f11550a276bd47787b4cf0b9b751f/train_gpt.py#L136
-
-    def __init__(self, params, lr=0.01, weight_decay=0.95, momentum=0.95):
-        default = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        params = list(params)
-        sizes = {p.shape() for p in params}
-        param_groups = []
-
-    def step(self, params: dict[str, mx.array], grads: dict[str, mx.array], lr: float, step: int, momentum: float):
-        momentum = self.momentum
-        pass
+# class NorMuon(optim):
+#     # NorMuon: https://github.com/zichongli5/modded-nanogpt/blob/fe96141e7c3f11550a276bd47787b4cf0b9b751f/train_gpt.py#L136
+#
+#     def __init__(self, params, lr=0.01, weight_decay=0.95, momentum=0.95):
+#         default = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+#         params = list(params)
+#         sizes = {p.shape() for p in params}
+#         param_groups = []
+#
+#     def step(self, params: dict[str, mx.array], grads: dict[str, mx.array], lr: float, step: int, momentum: float):
+#         momentum = self.momentum
+#         pass
 
 
 
