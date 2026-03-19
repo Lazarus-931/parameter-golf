@@ -131,6 +131,11 @@ jobs:
             echo "--- $TARGET ready ---"
           done
 
+          # Sync checked-out code to local work dir (runner may not be in hostfile)
+          rsync -a --delete \
+            --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
+            "$CHECKOUT_DIR/" "$PG_WORK/"
+
           # Symlink data locally
           mkdir -p "$PG_WORK/data/datasets"
           if [ ! -d "$PG_DATA/fineweb10B_sp1024" ]; then
