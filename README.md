@@ -182,14 +182,19 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 
 Results from our self-hosted CI/CD pipeline running on Mac Minis (M4, 16GB) connected via Tailscale.
 
-| Run | Hosts | Steps | Final Train Loss | Step Avg | Tok/s | Wall Time | Status |
-|-----|------:|------:|-----------------:|---------:|------:|----------:|--------|
-| Single Mini | 1 (Derek) | 200/200 | 3.8882 | 750ms | 10,913 | ~2.5 min | Completed |
-| Distributed (ring) | 2 (Derek + Lexie) | 10/200 | 6.6471 | 4,276ms | 1,745 | ~17 min | Rank 1 crashed (exit 255) |
+### Baseline (200 steps, single Mini)
 
-**Config:** `TRAIN_BATCH_TOKENS=8192`, `GRAD_ACCUM_STEPS=1`, `MLX_MAX_MICROBATCH_TOKENS=4096`, `VAL_LOSS_EVERY=0`, 17M param model (9 layers, 512 dim, 1024 vocab)
+| Metric | Value |
+|--------|-------|
+| val_bpb | **2.3320** (int8+zlib roundtrip) |
+| val_loss | 3.9374 (int8+zlib roundtrip) |
+| Compressed model | 10.3 MB |
+| Train time | ~2.5 min (200 steps, 750ms/step, ~10.9K tok/s) |
+| Final train_loss | 3.8808 |
 
+**Config:** `TRAIN_BATCH_TOKENS=8192`, `GRAD_ACCUM_STEPS=1`, `MLX_MAX_MICROBATCH_TOKENS=4096`, 17M param model (9 layers, 512 dim, 1024 vocab)
 
+*Note: Leaderboard baseline is 1.2244 val_bpb (20K steps on 8xH100). Our 200-step Mac Mini run is a dev iteration baseline, not a competition submission.*
 
 ## Support
 

@@ -196,14 +196,40 @@ jobs:
           fi
           echo "Training script exit code: $?"
 
-      - name: Collect results
+      - name: Collect and summarize
         if: always()
         run: |
           sync
           cp -r "$PG_WORK/logs/" ./logs/ 2>/dev/null || true
-          # Show last 20 lines of run log to confirm val_bpb was captured
-          echo "=== Last 20 lines of run log ==="
-          tail -20 ./logs/*.txt 2>/dev/null || echo "No run log found"
+          LOG=$(ls ./logs/*.txt 2>/dev/null | head -1)
+
+          if [ -z "$LOG" ]; then
+            echo "No training log found"
+            exit 0
+          fi
+
+          echo ""
+          echo "========== RESULTS =========="
+          # Key metrics: config, final train loss, val_loss, val_bpb, model size
+          grep -E "^model_params:|^iterations:|^optimizer:" "$LOG" 2>/dev/null || true
+          echo "---"
+          grep -E "^step:(1|10)/|^step:.*train_loss.*step_avg" "$LOG" | tail -3
+          echo "---"
+          grep -E "^step:.*val_loss.*val_bpb" "$LOG" 2>/dev/null || true
+          grep -E "^saved_model:|^serialized_model|^final_int8" "$LOG" 2>/dev/null || true
+          grep -E "^stopping_early" "$LOG" 2>/dev/null || true
+          echo "============================="
+
+          # GitHub step summary
+          {
+            echo "## Training Results"
+            echo '```'
+            grep -E "^step:.*val_bpb|^final_int8_zlib_roundtrip " "$LOG" 2>/dev/null || echo "val_bpb not yet available"
+            grep -E "^serialized_model" "$LOG" 2>/dev/null || true
+            echo ""
+            echo "Steps: $(grep -c '^step:' "$LOG") | $(grep '^step:' "$LOG" | tail -1)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Upload training log
         if: always()
@@ -211,17 +237,6 @@ jobs:
         with:
           name: train-log-${{ github.sha }}
           path: logs/
-
-      - name: Print summary
-        if: always()
-        run: |
-          NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))" 2>/dev/null || echo "?")
-          echo "## Distributed Training Results ($NUM_HOSTS hosts)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          # Show final results from the script's log file
-          grep -E "step:.*val_|final_|saved_|serialized_|stopping" ./logs/*.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
-          tail -5 ./logs/*.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No log output" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Cleanup training artifacts
         if: always()
