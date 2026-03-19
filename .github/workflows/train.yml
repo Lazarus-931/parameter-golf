@@ -20,10 +20,17 @@ on:
         description: "Run identifier"
         default: "ci_run"
 
+# All paths are absolute and identical on every Mac Mini.
+# This is required because mlx.launch uses the coordinator's Python
+# path on all remote hosts.
+env:
+  PG_ROOT: /opt/parameter-golf
+  PG_VENV: /opt/parameter-golf/venv
+  PG_WORK: /opt/parameter-golf/work
+  PG_DATA: /opt/parameter-golf/data
+
 jobs:
   distributed-train:
-    # Runs on ONE self-hosted runner (the coordinator). It launches
-    # mlx.launch across ALL hosts listed in cluster/hostfile.json.
     runs-on: [self-hosted, parameter-golf]
     timeout-minutes: 120
 
@@ -31,43 +38,36 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set paths
+      - name: Ensure shared dirs and venv (local)
         run: |
-          echo "WORK_DIR=$HOME/parameter-golf-work" >> $GITHUB_ENV
-          echo "VENV_DIR=$HOME/parameter-golf-venv" >> $GITHUB_ENV
-          echo "DATA_DIR=$HOME/parameter-golf-data" >> $GITHUB_ENV
-          # Find python 3.10+ (homebrew python3.12 or python3)
+          # Create shared dir if needed (setup-runner.sh should have done this)
+          sudo mkdir -p "$PG_ROOT" && sudo chown "$(whoami)" "$PG_ROOT"
+          mkdir -p "$PG_WORK" "$PG_DATA"
+
+          # Find python 3.10+
           if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
-            echo "PY=/opt/homebrew/bin/python3.12" >> $GITHUB_ENV
+            PY=/opt/homebrew/bin/python3.12
           elif command -v python3.12 &>/dev/null; then
-            echo "PY=python3.12" >> $GITHUB_ENV
+            PY=python3.12
           else
-            echo "PY=python3" >> $GITHUB_ENV
+            PY=python3
           fi
 
-      - name: Ensure venv
-        run: |
-          if [ ! -d "$VENV_DIR" ]; then
-            $PY -m venv "$VENV_DIR"
+          if [ ! -d "$PG_VENV" ]; then
+            $PY -m venv "$PG_VENV"
           fi
-          source "$VENV_DIR/bin/activate"
+          source "$PG_VENV/bin/activate"
           pip install --upgrade pip
           pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm
           echo "Python: $(python3 --version)"
           echo "MLX: $(python3 -c 'import mlx.core as mx; print(mx.__version__)' 2>/dev/null || echo 'unknown')"
-          # mlx.launch is a CLI script installed by mlx, not a python module
-          which mlx.launch || { echo "ERROR: mlx.launch not found in PATH"; pip show mlx | grep Location; ls -la "$VENV_DIR/bin/mlx"* 2>/dev/null; exit 1; }
+          which mlx.launch
 
       - name: Sync code and data to all hosts
         run: |
-          source "$VENV_DIR/bin/activate"
+          source "$PG_VENV/bin/activate"
           HOSTFILE="cluster/hostfile.json"
-          if [ ! -f "$HOSTFILE" ]; then
-            echo "ERROR: cluster/hostfile.json not found."
-            exit 1
-          fi
 
-          # Extract ssh targets (user@ip) from hostfile.json
           SSH_TARGETS=$(python3 -c "
           import json
           with open('$HOSTFILE') as f:
@@ -78,26 +78,22 @@ jobs:
 
           CHECKOUT_DIR="$(pwd)"
 
-          # Remote paths use ~ so they expand to each remote user's home
-          R_WORK=parameter-golf-work
-          R_VENV=parameter-golf-venv
-          R_DATA=parameter-golf-data
-
           for TARGET in $SSH_TARGETS; do
             echo "--- Syncing to $TARGET ---"
 
-            # Sync the code checkout
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" "mkdir -p ~/$R_WORK"
+            # Create shared dirs on remote (needs sudo the first time)
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
+              "sudo mkdir -p /opt/parameter-golf && sudo chown \$(whoami) /opt/parameter-golf && mkdir -p /opt/parameter-golf/work /opt/parameter-golf/data"
+
+            # Sync code
             rsync -az --delete \
               --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
               -e "ssh -o StrictHostKeyChecking=no" \
-              "$CHECKOUT_DIR/" "$TARGET:~/$R_WORK/"
+              "$CHECKOUT_DIR/" "$TARGET:/opt/parameter-golf/work/"
 
             # Ensure venv + dataset on remote
             ssh -o StrictHostKeyChecking=no "$TARGET" '
-              R_WORK=~/parameter-golf-work
-              R_VENV=~/parameter-golf-venv
-              R_DATA=~/parameter-golf-data
+              PG=/opt/parameter-golf
 
               # Find python 3.10+
               if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
@@ -108,80 +104,75 @@ jobs:
                 PY=python3
               fi
 
-              # Venv
-              if [ ! -d $R_VENV ]; then
-                $PY -m venv $R_VENV
-                source $R_VENV/bin/activate
+              # Venv at shared path
+              if [ ! -d $PG/venv ]; then
+                $PY -m venv $PG/venv
+                source $PG/venv/bin/activate
                 pip install --upgrade pip
                 pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
               fi
-              source $R_VENV/bin/activate
+              source $PG/venv/bin/activate
 
               # Dataset
-              if [ ! -d $R_DATA/fineweb10B_sp1024 ]; then
-                cd $R_WORK
+              if [ ! -d $PG/data/fineweb10B_sp1024 ]; then
+                cd $PG/work
                 python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
-                mkdir -p $R_DATA
-                mv ./data/datasets/fineweb10B_sp1024 $R_DATA/
-                cp -r ./data/tokenizers $R_DATA/ 2>/dev/null || true
+                mv ./data/datasets/fineweb10B_sp1024 $PG/data/
+                cp -r ./data/tokenizers $PG/data/ 2>/dev/null || true
               fi
 
               # Symlink data into work dir
-              mkdir -p $R_WORK/data/datasets
-              ln -sfn $R_DATA/fineweb10B_sp1024 $R_WORK/data/datasets/fineweb10B_sp1024
-              if [ -d $R_DATA/tokenizers ]; then
-                ln -sfn $R_DATA/tokenizers $R_WORK/data/tokenizers
+              mkdir -p $PG/work/data/datasets
+              ln -sfn $PG/data/fineweb10B_sp1024 $PG/work/data/datasets/fineweb10B_sp1024
+              if [ -d $PG/data/tokenizers ]; then
+                ln -sfn $PG/data/tokenizers $PG/work/data/tokenizers
               fi
             '
             echo "--- $TARGET ready ---"
           done
 
-          # Also symlink data locally for the coordinator
-          mkdir -p "$WORK_DIR/data/datasets"
-          if [ ! -d "$DATA_DIR/fineweb10B_sp1024" ]; then
+          # Symlink data locally
+          mkdir -p "$PG_WORK/data/datasets"
+          if [ ! -d "$PG_DATA/fineweb10B_sp1024" ]; then
+            cd "$PG_WORK"
             python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
-            mkdir -p "$DATA_DIR"
-            mv ./data/datasets/fineweb10B_sp1024 "$DATA_DIR/"
-            cp -r ./data/tokenizers "$DATA_DIR/" 2>/dev/null || true
+            mv ./data/datasets/fineweb10B_sp1024 "$PG_DATA/"
+            cp -r ./data/tokenizers "$PG_DATA/" 2>/dev/null || true
+            cd "$CHECKOUT_DIR"
           fi
-          ln -sfn "$DATA_DIR/fineweb10B_sp1024" "$WORK_DIR/data/datasets/fineweb10B_sp1024"
-          if [ -d "$DATA_DIR/tokenizers" ]; then
-            ln -sfn "$DATA_DIR/tokenizers" "$WORK_DIR/data/tokenizers"
+          ln -sfn "$PG_DATA/fineweb10B_sp1024" "$PG_WORK/data/datasets/fineweb10B_sp1024"
+          if [ -d "$PG_DATA/tokenizers" ]; then
+            ln -sfn "$PG_DATA/tokenizers" "$PG_WORK/data/tokenizers"
           fi
 
       - name: Distributed train
         run: |
-          source "$VENV_DIR/bin/activate"
+          source "$PG_VENV/bin/activate"
 
           NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))")
           echo "Launching distributed training across $NUM_HOSTS hosts"
 
-          # Copy hostfile to work dir so mlx.launch can find it
-          cp cluster/hostfile.json "$WORK_DIR/hostfile.json"
+          cp cluster/hostfile.json "$PG_WORK/hostfile.json"
 
-          # mlx.launch SSHes to each host and runs the script there.
-          # Env vars and script path must work on all machines, so use
-          # ~/parameter-golf-work which each machine has under its own $HOME.
+          # All paths are /opt/parameter-golf/... — identical on every host
           RUN_ID="${{ inputs.run_id || github.sha }}" \
           ITERATIONS="${{ inputs.iterations || '200' }}" \
           TRAIN_BATCH_TOKENS="${{ inputs.train_batch_tokens || '8192' }}" \
           VAL_LOSS_EVERY=0 \
           VAL_BATCH_SIZE=8192 \
-          DATA_PATH="$HOME/parameter-golf-work/data/datasets/fineweb10B_sp1024" \
-          TOKENIZER_PATH="$HOME/parameter-golf-work/data/tokenizers/fineweb_1024_bpe.model" \
-          OUT_DIR="$HOME/parameter-golf-work/logs" \
-          # mlx.launch SSHes to each host and runs: <python> <script>
-          # Use the venv python path that exists on each Mini at ~/parameter-golf-venv
+          DATA_PATH="/opt/parameter-golf/work/data/datasets/fineweb10B_sp1024" \
+          TOKENIZER_PATH="/opt/parameter-golf/work/data/tokenizers/fineweb_1024_bpe.model" \
+          OUT_DIR="/opt/parameter-golf/work/logs" \
           mlx.launch \
-            --hostfile "$WORK_DIR/hostfile.json" \
+            --hostfile "$PG_WORK/hostfile.json" \
             --backend ring \
             --verbose \
-            -- ~/parameter-golf-venv/bin/python3 ~/parameter-golf-work/train_gpt_mlx.py 2>&1 | tee train_log.txt
+            "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee train_log.txt
 
       - name: Collect results
         if: always()
         run: |
-          cp -r ~/parameter-golf-work/logs/ ./logs/ 2>/dev/null || true
+          cp -r /opt/parameter-golf/work/logs/ ./logs/ 2>/dev/null || true
 
       - name: Upload training log
         if: always()
