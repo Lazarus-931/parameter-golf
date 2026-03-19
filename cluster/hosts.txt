@@ -1,0 +1,7 @@
+# Add one Tailscale IP per line for each Mac Mini in the cluster.
+# These are used by mlx.launch to coordinate distributed training.
+# Lines starting with # are ignored.
+#
+# Example:
+# 100.64.1.10
+# 100.64.1.11

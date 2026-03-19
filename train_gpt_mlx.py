@@ -27,6 +27,24 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
 # ==============================================================================
+# DISTRIBUTED SETUP
+# ==============================================================================
+
+def _init_distributed() -> tuple[int, int]:
+    """Initialize MLX distributed. Returns (rank, world_size)."""
+    if mx.distributed.is_available():
+        world = mx.distributed.init()
+        return world.rank(), world.size()
+    return 0, 1
+
+
+def _allreduce_mean(x: mx.array) -> mx.array:
+    """All-reduce mean across distributed workers. No-op for single process."""
+    if mx.distributed.is_available() and mx.distributed.init().size() > 1:
+        return mx.distributed.all_sum(x) / mx.distributed.init().size()
+    return x
+
+# ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
 # ==============================================================================
 
@@ -214,10 +232,21 @@ class TokenStream:
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        rank: int = 0,
+        world_size: int = 1,
     ):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
+        all_files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        # In distributed mode, each rank takes a strided subset of shards.
+        if world_size > 1:
+            self.files = all_files[rank::world_size]
+            if not self.files:
+                raise RuntimeError(
+                    f"Rank {rank} has no data shards (total={len(all_files)}, world_size={world_size})"
+                )
+        else:
+            self.files = all_files
         self.epoch = 1
         self.file_idx = 0
         self.log_fn = log_fn
@@ -256,8 +285,10 @@ class TokenLoader:
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        rank: int = 0,
+        world_size: int = 1,
     ):
-        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
+        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name, rank=rank, world_size=world_size)
 
     def next_batch(self, batch_tokens: int, seq_len: int) -> tuple[mx.array, mx.array]:
         usable = (batch_tokens // seq_len) * seq_len
@@ -823,15 +854,21 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
 
 def main() -> None:
     # ==============================================================================
-    # TOKENIZER + VALIDATION METRIC SETUP
+    # DISTRIBUTED + TOKENIZER + VALIDATION METRIC SETUP
     # ==============================================================================
+    rank, world_size = _init_distributed()
+    is_main = rank == 0
+
     args = Hyperparameters()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logfile = out_dir / f"{args.run_id}.txt"
-    print(logfile)
+    if is_main:
+        print(logfile)
 
     def log(msg: str, console: bool = True) -> None:
+        if not is_main:
+            return
         if console:
             print(msg)
         with logfile.open("a", encoding="utf-8") as f:
@@ -866,9 +903,11 @@ def main() -> None:
     # ==============================================================================
     # TRAINING SETUP
     # ==============================================================================
-    mx.random.seed(args.seed)
+    mx.random.seed(args.seed + rank)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, rank=rank, world_size=world_size)
+    if world_size > 1:
+        log(f"distributed:rank={rank} world_size={world_size} shards_per_rank={len(train_loader.stream.files)}")
 
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
@@ -981,7 +1020,7 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, rank=rank, world_size=world_size)
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1024,6 +1063,10 @@ def main() -> None:
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
 
         grads = tree_unflatten(list(accum.items()))
+        # Distributed: average gradients and loss across all workers.
+        if world_size > 1:
+            grads = nn.average_gradients(grads)
+            train_loss = _allreduce_mean(train_loss)
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
@@ -1042,8 +1085,10 @@ def main() -> None:
             stop_after_step = step
 
     # ==============================================================================
-    # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
+    # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL (rank 0 only)
     # ==============================================================================
+    if not is_main:
+        return
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
