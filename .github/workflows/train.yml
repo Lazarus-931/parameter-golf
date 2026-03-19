@@ -36,19 +36,26 @@ jobs:
           echo "WORK_DIR=$HOME/parameter-golf-work" >> $GITHUB_ENV
           echo "VENV_DIR=$HOME/parameter-golf-venv" >> $GITHUB_ENV
           echo "DATA_DIR=$HOME/parameter-golf-data" >> $GITHUB_ENV
+          # Find python 3.10+ (homebrew python3.12 or python3)
+          if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
+            echo "PY=/opt/homebrew/bin/python3.12" >> $GITHUB_ENV
+          elif command -v python3.12 &>/dev/null; then
+            echo "PY=python3.12" >> $GITHUB_ENV
+          else
+            echo "PY=python3" >> $GITHUB_ENV
+          fi
 
       - name: Ensure venv
         run: |
           if [ ! -d "$VENV_DIR" ]; then
-            python3 -m venv "$VENV_DIR"
-            source "$VENV_DIR/bin/activate"
-            pip install --upgrade pip
+            $PY -m venv "$VENV_DIR"
           fi
           source "$VENV_DIR/bin/activate"
+          pip install --upgrade pip
           pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm
-          echo "MLX version: $(python3 -c 'import mlx; print(mlx.__version__)')"
-          # Verify mlx.launch works
-          python3 -m mlx.launch --help > /dev/null 2>&1 || echo "WARNING: mlx.launch not available"
+          echo "Python: $(python3 --version)"
+          echo "MLX: $(python3 -c 'import mlx.core as mx; print(mx.__version__)' 2>/dev/null || echo 'unknown')"
+          python3 -m mlx.launch --help > /dev/null 2>&1 || { echo "ERROR: mlx.launch not available"; exit 1; }
 
       - name: Sync code and data to all hosts
         run: |
@@ -91,12 +98,21 @@ jobs:
               R_VENV=~/parameter-golf-venv
               R_DATA=~/parameter-golf-data
 
+              # Find python 3.10+
+              if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
+                PY=/opt/homebrew/bin/python3.12
+              elif command -v python3.12 &>/dev/null; then
+                PY=python3.12
+              else
+                PY=python3
+              fi
+
               # Venv
               if [ ! -d $R_VENV ]; then
-                python3 -m venv $R_VENV
+                $PY -m venv $R_VENV
                 source $R_VENV/bin/activate
                 pip install --upgrade pip
-                pip install "mlx>=0.25" numpy sentencepiece huggingface-hub datasets tqdm
+                pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
               fi
               source $R_VENV/bin/activate
 
