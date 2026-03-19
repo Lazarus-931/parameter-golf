@@ -178,6 +178,22 @@ Non-record submissions should be made in the same fashion as SOTA records, as de
 
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but the best models should stay in the `/records` folder.
 
+## Training Times (Mac Mini M4 Cluster)
+
+Results from our self-hosted CI/CD pipeline running on Mac Minis (M4, 16GB) connected via Tailscale.
+
+| Run | Hosts | Steps | Final Train Loss | Step Avg | Tok/s | Wall Time | Status |
+|-----|------:|------:|-----------------:|---------:|------:|----------:|--------|
+| Single Mini | 1 (Derek) | 200/200 | 3.8882 | 750ms | 10,913 | ~2.5 min | Completed |
+| Distributed (ring) | 2 (Derek + Lexie) | 10/200 | 6.6471 | 4,276ms | 1,745 | ~17 min | Rank 1 crashed (exit 255) |
+
+**Config:** `TRAIN_BATCH_TOKENS=8192`, `GRAD_ACCUM_STEPS=1`, `MLX_MAX_MICROBATCH_TOKENS=4096`, `VAL_LOSS_EVERY=0`, 17M param model (9 layers, 512 dim, 1024 vocab)
+
+**Takeaways:**
+- Single Mini mode is ~6x faster per step than 2-Mini distributed due to Tailscale network overhead dominating the small batch size
+- The distributed ring backend (`mlx.launch`) works but is only worthwhile with larger batch sizes or faster interconnects
+- Training runs automatically on push via GitHub Actions self-hosted runners
+
 ## Support
 
 

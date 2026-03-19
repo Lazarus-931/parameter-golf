@@ -146,6 +146,8 @@ jobs:
           fi
 
       - name: Distributed train
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
           source "$PG_VENV/bin/activate"
 
@@ -165,6 +167,8 @@ jobs:
           export GRAD_ACCUM_STEPS=1
           export MLX_MAX_MICROBATCH_TOKENS=4096
 
+          cd "$PG_WORK"
+
           if [ "$NUM_HOSTS" -gt 1 ]; then
             # Multi-host: use mlx.launch to coordinate distributed training
             mlx.launch \
@@ -178,17 +182,23 @@ jobs:
               --env "VAL_BATCH_SIZE=8192" \
               --env "GRAD_ACCUM_STEPS=1" \
               --env "MLX_MAX_MICROBATCH_TOKENS=4096" \
-              "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+              "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee "$GITHUB_WORKSPACE/train_log.txt"
           else
             # Single host: run directly, no mlx.launch overhead
             echo "Single host mode — running directly"
-            python3 "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee train_log.txt
+            python3 -u "$PG_WORK/train_gpt_mlx.py" 2>&1 | tee "$GITHUB_WORKSPACE/train_log.txt"
           fi
 
       - name: Collect results
         if: always()
         run: |
+          # Wait for log files to be fully flushed
+          sync
           cp -r /opt/parameter-golf/work/logs/ ./logs/ 2>/dev/null || true
+          echo "=== Last 10 lines of train_log.txt ==="
+          tail -10 train_log.txt 2>/dev/null || echo "No train_log.txt"
+          echo "=== Last 10 lines of run log ==="
+          tail -10 ./logs/*.txt 2>/dev/null || echo "No run log"
 
       - name: Upload training log
         if: always()
@@ -207,3 +217,26 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           tail -30 train_log.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No log output" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup training artifacts
+        if: always()
+        run: |
+          # Remove logs and model files from the coordinator
+          rm -rf "$PG_WORK/logs" "$PG_WORK/hostfile.json"
+
+          # Remove logs from all remote hosts
+          source "$PG_VENV/bin/activate"
+          HOSTFILE="cluster/hostfile.json"
+          SSH_TARGETS=$(python3 -c "
+          import json
+          with open('$HOSTFILE') as f:
+              hosts = json.load(f)
+          for h in hosts:
+              print(h['ssh'])
+          " 2>/dev/null || true)
+
+          for TARGET in $SSH_TARGETS; do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
+              "rm -rf /opt/parameter-golf/work/logs" 2>/dev/null || true
+          done
+          echo "Cleaned up training artifacts from all hosts"
