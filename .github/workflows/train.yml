@@ -23,7 +23,7 @@ on:
 jobs:
   distributed-train:
     # Runs on ONE self-hosted runner (the coordinator). It launches
-    # mlx.launch across ALL hosts listed in cluster/hosts.txt.
+    # mlx.launch across ALL hosts listed in cluster/hostfile.json.
     runs-on: [self-hosted, parameter-golf]
     timeout-minutes: 120
 
@@ -49,52 +49,48 @@ jobs:
             pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
           }
 
-      - name: Ensure dataset cached
-        run: |
-          source "$VENV_DIR/bin/activate"
-          if [ ! -d "$DATA_DIR/fineweb10B_sp1024" ]; then
-            python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
-            mkdir -p "$DATA_DIR"
-            mv ./data/datasets/fineweb10B_sp1024 "$DATA_DIR/"
-            cp -r ./data/tokenizers "$DATA_DIR/" 2>/dev/null || true
-          fi
-
       - name: Sync code and data to all hosts
         run: |
-          HOSTS_FILE="cluster/hosts.txt"
-          if [ ! -f "$HOSTS_FILE" ]; then
-            echo "ERROR: cluster/hosts.txt not found. Add your Mac Mini Tailscale IPs there."
+          source "$VENV_DIR/bin/activate"
+          HOSTFILE="cluster/hostfile.json"
+          if [ ! -f "$HOSTFILE" ]; then
+            echo "ERROR: cluster/hostfile.json not found."
             exit 1
           fi
 
-          # Read hosts (skip comments and blanks)
-          HOSTS=$(grep -v '^\s*#' "$HOSTS_FILE" | grep -v '^\s*$' | tr '\n' ' ')
-          echo "Cluster hosts: $HOSTS"
+          # Extract ssh targets (user@ip) from hostfile.json
+          SSH_TARGETS=$(python3 -c "
+          import json
+          with open('$HOSTFILE') as f:
+              hosts = json.load(f)
+          for h in hosts:
+              print(h['ssh'])
+          ")
 
-          SELF_IP=$(ipconfig getifaddr en0 2>/dev/null || echo "")
           CHECKOUT_DIR="$(pwd)"
 
-          for HOST in $HOSTS; do
-            echo "--- Syncing to $HOST ---"
+          for TARGET in $SSH_TARGETS; do
+            echo "--- Syncing to $TARGET ---"
+
             # Sync the code checkout
-            ssh -o StrictHostKeyChecking=no "$HOST" "mkdir -p $WORK_DIR" || true
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" "mkdir -p $WORK_DIR"
             rsync -az --delete \
               --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
-              "$CHECKOUT_DIR/" "$HOST:$WORK_DIR/"
+              -e "ssh -o StrictHostKeyChecking=no" \
+              "$CHECKOUT_DIR/" "$TARGET:$WORK_DIR/"
 
-            # Ensure venv exists on remote
-            ssh "$HOST" "
+            # Ensure venv + dataset on remote
+            ssh -o StrictHostKeyChecking=no "$TARGET" "
+              # Venv
               if [ ! -d $VENV_DIR ]; then
                 python3 -m venv $VENV_DIR
                 source $VENV_DIR/bin/activate
                 pip install --upgrade pip
                 pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
               fi
-            " || true
-
-            # Ensure dataset cached on remote
-            ssh "$HOST" "
               source $VENV_DIR/bin/activate
+
+              # Dataset
               if [ ! -d $DATA_DIR/fineweb10B_sp1024 ]; then
                 cd $WORK_DIR
                 python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
@@ -102,6 +98,7 @@ jobs:
                 mv ./data/datasets/fineweb10B_sp1024 $DATA_DIR/
                 cp -r ./data/tokenizers $DATA_DIR/ 2>/dev/null || true
               fi
+
               # Symlink data into work dir
               mkdir -p $WORK_DIR/data/datasets
               ln -sfn $DATA_DIR/fineweb10B_sp1024 $WORK_DIR/data/datasets/fineweb10B_sp1024
@@ -109,24 +106,31 @@ jobs:
                 ln -sfn $DATA_DIR/tokenizers $WORK_DIR/data/tokenizers
               fi
             "
+            echo "--- $TARGET ready ---"
           done
 
-          # Also symlink data locally
-          mkdir -p ./data/datasets
-          ln -sfn "$DATA_DIR/fineweb10B_sp1024" ./data/datasets/fineweb10B_sp1024
+          # Also symlink data locally for the coordinator
+          mkdir -p "$WORK_DIR/data/datasets"
+          if [ ! -d "$DATA_DIR/fineweb10B_sp1024" ]; then
+            python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
+            mkdir -p "$DATA_DIR"
+            mv ./data/datasets/fineweb10B_sp1024 "$DATA_DIR/"
+            cp -r ./data/tokenizers "$DATA_DIR/" 2>/dev/null || true
+          fi
+          ln -sfn "$DATA_DIR/fineweb10B_sp1024" "$WORK_DIR/data/datasets/fineweb10B_sp1024"
           if [ -d "$DATA_DIR/tokenizers" ]; then
-            ln -sfn "$DATA_DIR/tokenizers" ./data/tokenizers
+            ln -sfn "$DATA_DIR/tokenizers" "$WORK_DIR/data/tokenizers"
           fi
 
       - name: Distributed train
         run: |
           source "$VENV_DIR/bin/activate"
 
-          # Build comma-separated host list from cluster/hosts.txt
-          HOSTS=$(grep -v '^\s*#' cluster/hosts.txt | grep -v '^\s*$' | paste -sd ',' -)
-          NUM_HOSTS=$(grep -v '^\s*#' cluster/hosts.txt | grep -v '^\s*$' | wc -l | tr -d ' ')
+          NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))")
+          echo "Launching distributed training across $NUM_HOSTS hosts"
 
-          echo "Launching distributed training across $NUM_HOSTS hosts: $HOSTS"
+          # Copy hostfile to work dir so mlx.launch can find it
+          cp cluster/hostfile.json "$WORK_DIR/hostfile.json"
 
           RUN_ID="${{ inputs.run_id || github.sha }}" \
           ITERATIONS="${{ inputs.iterations || '200' }}" \
@@ -137,14 +141,13 @@ jobs:
           TOKENIZER_PATH="$WORK_DIR/data/tokenizers/fineweb_1024_bpe.model" \
           OUT_DIR="$WORK_DIR/logs" \
           python3 -m mlx.launch \
-            --hosts "$HOSTS" \
+            --hostfile "$WORK_DIR/hostfile.json" \
             --backend ring \
             "$WORK_DIR/train_gpt_mlx.py" 2>&1 | tee train_log.txt
 
       - name: Collect results
         if: always()
         run: |
-          # Copy logs from work dir
           cp -r ~/parameter-golf-work/logs/ ./logs/ 2>/dev/null || true
 
       - name: Upload training log
@@ -159,8 +162,8 @@ jobs:
       - name: Print summary
         if: always()
         run: |
-          HOSTS=$(grep -v '^\s*#' cluster/hosts.txt | grep -v '^\s*$' | wc -l | tr -d ' ')
-          echo "## Distributed Training Results ($HOSTS hosts)" >> $GITHUB_STEP_SUMMARY
+          NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))" 2>/dev/null || echo "?")
+          echo "## Distributed Training Results ($NUM_HOSTS hosts)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           tail -30 train_log.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No log output" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
