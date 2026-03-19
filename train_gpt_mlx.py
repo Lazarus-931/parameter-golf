@@ -58,10 +58,21 @@ COMPUTE_DTYPE = mx.bfloat16
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+def _default_path(env_key: str, relative: str) -> str:
+    """Return env override, or /opt/parameter-golf/work/<relative> if it exists, else ./<relative>."""
+    val = os.environ.get(env_key)
+    if val:
+        return val
+    shared = os.path.join("/opt/parameter-golf/work", relative)
+    if os.path.exists(shared):
+        return shared
+    return relative
+
+
 class Hyperparameters:
     # Data / tokenizer.
-    data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
-    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    data_path: str = _default_path("DATA_PATH", "data/datasets/fineweb10B_sp1024")
+    tokenizer_path: str = _default_path("TOKENIZER_PATH", "data/tokenizers/fineweb_1024_bpe.model")
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
@@ -108,7 +119,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    out_dir: str = os.environ.get("OUT_DIR", "logs")
+    out_dir: str = _default_path("OUT_DIR", "logs")
 
     @property
     def train_files(self) -> str:

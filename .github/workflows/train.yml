@@ -154,15 +154,13 @@ jobs:
 
           cp cluster/hostfile.json "$PG_WORK/hostfile.json"
 
-          # All paths are /opt/parameter-golf/... — identical on every host
+          # The training script auto-detects /opt/parameter-golf/work paths.
+          # No env vars needed — they're baked into the script defaults.
           RUN_ID="${{ inputs.run_id || github.sha }}" \
           ITERATIONS="${{ inputs.iterations || '200' }}" \
           TRAIN_BATCH_TOKENS="${{ inputs.train_batch_tokens || '8192' }}" \
           VAL_LOSS_EVERY=0 \
           VAL_BATCH_SIZE=8192 \
-          DATA_PATH="/opt/parameter-golf/work/data/datasets/fineweb10B_sp1024" \
-          TOKENIZER_PATH="/opt/parameter-golf/work/data/tokenizers/fineweb_1024_bpe.model" \
-          OUT_DIR="/opt/parameter-golf/work/logs" \
           mlx.launch \
             --hostfile "$PG_WORK/hostfile.json" \
             --backend ring \
