@@ -1101,10 +1101,15 @@ def main() -> None:
             break
 
         # Start Metal GPU capture after warmup for the first N profiled steps
+        # Requires MTL_CAPTURE_ENABLED=1 to be set before process start
         if profile_steps > 0 and step == 0 and not profiling_active:
             log(f"profile:starting Metal capture for {profile_steps} steps -> {profile_trace}")
-            mx.metal.start_capture(profile_trace)
-            profiling_active = True
+            try:
+                mx.metal.start_capture(profile_trace)
+                profiling_active = True
+            except RuntimeError as e:
+                log(f"profile:FAILED to start capture ({e}). Set MTL_CAPTURE_ENABLED=1 before launch.")
+                profile_steps = 0
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
