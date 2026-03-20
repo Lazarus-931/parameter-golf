@@ -1064,6 +1064,12 @@ def main() -> None:
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, rank=rank, world_size=world_size)
 
+    # Metal GPU profiling: set PROFILE_STEPS=N to capture a .gputrace of N training steps.
+    # Open the resulting trace in Xcode Instruments to see GPU/CPU timeline.
+    profile_steps = int(os.environ.get("PROFILE_STEPS", 0))
+    profile_trace = os.environ.get("PROFILE_TRACE", "training.gputrace")
+    profiling_active = False
+
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
@@ -1093,6 +1099,12 @@ def main() -> None:
             if stop_after_step is not None and step < args.iterations:
                 log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
+
+        # Start Metal GPU capture after warmup for the first N profiled steps
+        if profile_steps > 0 and step == 0 and not profiling_active:
+            log(f"profile:starting Metal capture for {profile_steps} steps -> {profile_trace}")
+            mx.metal.start_capture(profile_trace)
+            profiling_active = True
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
@@ -1126,6 +1138,11 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
+        if profiling_active and step >= profile_steps:
+            mx.metal.stop_capture()
+            profiling_active = False
+            log(f"profile:saved Metal trace to {profile_trace} ({profile_steps} steps)")
+
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 

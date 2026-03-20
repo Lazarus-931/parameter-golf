@@ -19,6 +19,9 @@ on:
       run_id:
         description: "Run identifier"
         default: "ci_run"
+      profile_steps:
+        description: "Metal GPU trace: capture N training steps (0 = off)"
+        default: "0"
 
 # All paths are absolute and identical on every Mac Mini.
 # This is required because mlx.launch uses the coordinator's Python
@@ -166,12 +169,16 @@ jobs:
           ITERATIONS="${{ inputs.iterations || '200' }}"
           BATCH="${{ inputs.train_batch_tokens || '8192' }}"
 
+          PROFILE_STEPS="${{ inputs.profile_steps || '0' }}"
+
           export RUN_ID ITERATIONS
           export TRAIN_BATCH_TOKENS="$BATCH"
           export VAL_LOSS_EVERY=0
           export VAL_BATCH_SIZE=8192
           export GRAD_ACCUM_STEPS=1
           export MLX_MAX_MICROBATCH_TOKENS=4096
+          export PROFILE_STEPS
+          export PROFILE_TRACE="$PG_WORK/training.gputrace"
 
           cd "$PG_WORK"
 
@@ -238,11 +245,18 @@ jobs:
           name: train-log-${{ github.sha }}
           path: logs/
 
+      - name: Upload GPU trace
+        if: always() && inputs.profile_steps != '0' && inputs.profile_steps != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-trace-${{ github.sha }}
+          path: ${{ env.PG_WORK }}/training.gputrace/
+
       - name: Cleanup training artifacts
         if: always()
         run: |
-          # Remove logs and model files from the coordinator
-          rm -rf "$PG_WORK/logs" "$PG_WORK/hostfile.json"
+          # Remove logs, model files, and traces from the coordinator
+          rm -rf "$PG_WORK/logs" "$PG_WORK/hostfile.json" "$PG_WORK/training.gputrace"
 
           # Remove logs from all remote hosts
           source "$PG_VENV/bin/activate"
