@@ -123,8 +123,8 @@ class Hyperparameters:
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
 
     nor_muon_momentum: float = float(os.environ.get("NOR_MUON_MOMENTUM", 0.95))
-    nor_muon_weight_decay: float = float(os.environ.get("NOR_MUON_WEIGHT_DECAY", 0.01))
-    nor_muon_learning_rate: float = float(os.environ.get("NOR_MUON_LEARNING_RATE", 0.02))
+    nor_muon_weight_decay: float = float(os.environ.get("NOR_MUON_WEIGHT_DECAY", 0.0))
+    nor_muon_learning_rate: float = float(os.environ.get("NOR_MUON_LEARNING_RATE", 0.05))
     nor_muon_beta2: float = float(os.environ.get("NOR_MUON_BETA2", 0.95))
     use_normuon: bool = bool(int(os.environ.get("USE_NORMUON", "1")))
 
