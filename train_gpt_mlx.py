@@ -80,7 +80,7 @@ class Hyperparameters:
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
-    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 262_144))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -126,7 +126,7 @@ class Hyperparameters:
     nor_muon_weight_decay: float = float(os.environ.get("NOR_MUON_WEIGHT_DECAY", 0.01))
     nor_muon_learning_rate: float = float(os.environ.get("NOR_MUON_LEARNING_RATE", 0.02))
     nor_muon_beta2: float = float(os.environ.get("NOR_MUON_BETA2", 0.95))
-    use_normuon: bool = bool(int(os.environ.get("USE_NORMUON", "0")))
+    use_normuon: bool = bool(int(os.environ.get("USE_NORMUON", "1")))
 
     # Depth recurrence: reuse a smaller set of blocks cyclically.
     # 0 means no sharing (num_unique_layers = num_layers).
