@@ -102,9 +102,10 @@ class Hyperparameters:
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: float = float(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 64))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -393,9 +394,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = dim * mlp_mult
+        hidden = int(dim * mlp_mult)
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
@@ -410,7 +411,7 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -437,7 +438,7 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, num_unique_layers: int = 0):
         super().__init__()
@@ -486,6 +487,14 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[(self.num_encoder_layers + i) % self.num_unique_layers](x, x0)
         return self.final_norm(x)
+
+    def per_token_loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+        """Return per-position cross-entropy losses: shape (batch, seq_len)."""
+        bsz, seqlen = input_ids.shape
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits = self.softcap(x @ self.tok_emb.weight.astype(x.dtype).T)
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none").reshape(bsz, seqlen)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
@@ -682,11 +691,11 @@ class SplitOptimizers:
         model.update(tree_unflatten(list(updated.items())))
 
 # ==============================================================================
-# QUANTIZATION (INT8 + ZLIB)
+# QUANTIZATION (INT6 + ZLIB)
 # ==============================================================================
-# - per-row int8 for 2D float tensors
-# - per-tensor int8 for other float tensors
-# - fp16 passthrough for small float tensors
+# - per-row int6 [-32, 31] for 2D float tensors (saves ~25% vs int8)
+# - per-tensor int6 for other float tensors
+# - fp16 passthrough for small float tensors and embeddings
 # - exact passthrough for non-floats
 
 MX_DTYPE_FROM_NAME = {
@@ -695,6 +704,9 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
+QUANT_BITS = int(os.environ.get("QUANT_BITS", 6))
+QUANT_MAX = (1 << (QUANT_BITS - 1)) - 1   # 31 for 6-bit, 127 for 8-bit
+QUANT_MIN = -(1 << (QUANT_BITS - 1))       # -32 for 6-bit, -128 for 8-bit
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
 INT8_PER_ROW_SCALE_DTYPE = np.float16
@@ -717,19 +729,21 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
 
 def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
+    qmax = float(QUANT_MAX)
+    qmin = float(QUANT_MIN)
     if f32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
         clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
-        scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
-        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
+        scale = np.maximum(clip_abs / qmax, 1.0 / qmax).astype(np.float32, copy=False)
+        q = np.clip(np.round(clipped / scale[:, None]), qmin, qmax).astype(np.int8, copy=False)
         return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
-    scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
+    scale = np.array(clip_abs / qmax if clip_abs > 0.0 else 1.0, dtype=np.float32)
+    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), qmin, qmax).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
 
 
@@ -771,7 +785,7 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
         dtypes[name] = str(arr.dtype).split(".")[-1]
         stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": f"int{QUANT_BITS}_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -903,57 +917,78 @@ def loss_and_grad_chunked(
 
 def eval_val(
     args: Hyperparameters,
-    compiled_loss,
+    model: GPT,
     val_tokens: np.ndarray,
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
     log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
-    if val_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
-            f"TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    val_batch_seqs = val_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
+    """Sliding window validation.
+
+    Each window is seq_len tokens. We advance by eval_stride and only score the
+    last eval_stride positions per window using per-token cross-entropy. When
+    eval_stride == seq_len this degrades to the original non-overlapping eval.
+    """
+    seq_len = args.train_seq_len
+    stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
+    n_tokens = val_tokens.size - 1
+
+    # Window start positions.
+    window_starts: list[int] = []
+    pos = 0
+    while pos + seq_len <= n_tokens:
+        window_starts.append(pos)
+        pos += stride
+    if pos < n_tokens and n_tokens >= seq_len:
+        window_starts.append(n_tokens - seq_len)
+    total_windows = len(window_starts)
+
+    val_batch_seqs = max(args.val_batch_size // seq_len, 1)
+    total_batches = max((total_windows + val_batch_seqs - 1) // val_batch_seqs, 1)
+
+    # Track which global positions have been scored (handles overlapping windows).
+    scored = np.zeros(n_tokens, dtype=np.bool_)
     total_loss_sum = 0.0
-    total_tokens = 0.0
+    total_tokens_scored = 0.0
     total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
-        batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
-        chunk = val_tokens[raw_start:raw_end]
-        x_np = chunk[:-1].reshape(-1, args.train_seq_len)
-        y_np = chunk[1:].reshape(-1, args.train_seq_len)
+    score_start = seq_len - stride  # local index where scoring begins in each window
+
+    for batch_idx in range(total_batches):
+        ws_batch = window_starts[batch_idx * val_batch_seqs : (batch_idx + 1) * val_batch_seqs]
+
+        x_np = np.stack([val_tokens[s : s + seq_len] for s in ws_batch])
+        y_np = np.stack([val_tokens[s + 1 : s + seq_len + 1] for s in ws_batch])
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
-        prev_ids = x_np.reshape(-1)
-        tgt_ids = y_np.reshape(-1)
-        bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
-        bytes_np += (
-            has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
-        ).astype(np.int16, copy=False)
-        total_tokens += chunk_token_count
-        total_bytes += float(bytes_np.astype(np.float64).sum())
+
+        # Per-token losses: (batch, seq_len).
+        per_tok = model.per_token_loss(x, y)
+        mx.eval(per_tok)
+        per_tok_np = np.array(per_tok, dtype=np.float64)
+
+        for i, ws in enumerate(ws_batch):
+            for local_pos in range(score_start, seq_len):
+                gpos = ws + local_pos
+                if gpos < n_tokens and not scored[gpos]:
+                    scored[gpos] = True
+                    total_loss_sum += per_tok_np[i, local_pos]
+                    total_tokens_scored += 1.0
+                    tgt_id = int(val_tokens[gpos + 1])
+                    prev_id = int(val_tokens[gpos])
+                    b = int(base_bytes_lut[tgt_id])
+                    if has_leading_space_lut[tgt_id] and not is_boundary_token_lut[prev_id]:
+                        b += 1
+                    total_bytes += b
+
         if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+            batch_idx + 1 == 1 or batch_idx + 1 == total_batches or (batch_idx + 1) % 25 == 0
         ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
-    val_loss = total_loss_sum / total_tokens
+            log_fn(f"val_progress:{batch_idx + 1}/{total_batches}")
+
+    val_loss = total_loss_sum / max(total_tokens_scored, 1.0)
     bits_per_token = val_loss / math.log(2.0)
-    val_bpb = bits_per_token * (total_tokens / total_bytes)
+    val_bpb = bits_per_token * (total_tokens_scored / max(total_bytes, 1.0))
     return val_loss, val_bpb
 
 # -----------------------------
@@ -1105,8 +1140,8 @@ def main() -> None:
         f"momentum:{args.nor_muon_momentum if args.use_normuon else args.muon_momentum} "
         f"muon_steps:{args.muon_backend_steps}"
     )
-    log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
+    log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path} eval_stride:{args.eval_stride}")
+    log(f"compute_dtype:{COMPUTE_DTYPE} quant_bits:{QUANT_BITS} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
@@ -1168,7 +1203,7 @@ def main() -> None:
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
-                compiled_loss,
+                model,
                 val_tokens,
                 base_bytes_lut,
                 has_leading_space_lut,
@@ -1272,7 +1307,7 @@ def main() -> None:
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        compiled_loss,
+        model,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
