@@ -125,6 +125,12 @@ class Hyperparameters:
     nor_muon_momentum: float = float(os.environ.get("NOR_MUON_MOMENTUM", 0.95))
     nor_muon_weight_decay: float = float(os.environ.get("NOR_MUON_WEIGHT_DECAY", 0.01))
     nor_muon_learning_rate: float = float(os.environ.get("NOR_MUON_LEARNING_RATE", 0.02))
+    nor_muon_beta2: float = float(os.environ.get("NOR_MUON_BETA2", 0.95))
+    use_normuon: bool = bool(int(os.environ.get("USE_NORMUON", "0")))
+
+    # Depth recurrence: reuse a smaller set of blocks cyclically.
+    # 0 means no sharing (num_unique_layers = num_layers).
+    num_unique_layers: int = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
 
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -433,12 +439,17 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, num_unique_layers: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+
+        # Depth recurrence: only allocate num_unique_layers blocks, reuse them
+        # cyclically for num_layers effective depth. 0 means no sharing.
+        self.num_layers = num_layers
+        self.num_unique_layers = num_unique_layers if num_unique_layers > 0 else num_layers
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -447,7 +458,7 @@ class GPT(nn.Module):
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            for _ in range(self.num_unique_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
@@ -468,15 +479,12 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_unique_layers](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[(self.num_encoder_layers + i) % self.num_unique_layers](x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -528,18 +536,89 @@ class Muon:
             out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
         return out
 
-# class NorMuon(optim):
-#     # NorMuon: https://github.com/zichongli5/modded-nanogpt/blob/fe96141e7c3f11550a276bd47787b4cf0b9b751f/train_gpt.py#L136
-#
-#     def __init__(self, params, lr=0.01, weight_decay=0.95, momentum=0.95):
-#         default = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-#         params = list(params)
-#         sizes = {p.shape() for p in params}
-#         param_groups = []
-#
-#     def step(self, params: dict[str, mx.array], grads: dict[str, mx.array], lr: float, step: int, momentum: float):
-#         momentum = self.momentum
-#         pass
+class NorMuon:
+    """Muon with per-row/column adaptive second-moment normalization.
+
+    After Newton-Schulz orthogonalization, normalizes the update per-row (tall
+    matrices) or per-column (wide matrices) using an EMA of second moments,
+    then rescales to preserve the original update norm. This redistributes
+    update energy more evenly across dimensions.
+
+    Reference: https://github.com/zichongli5/modded-nanogpt/blob/fe96141e/train_gpt.py#L136
+    """
+
+    def __init__(self, keys: list[str], params: dict[str, mx.array], args: Hyperparameters):
+        self.keys = keys
+        self.args = args
+        self.momentum_buf = {k: mx.zeros_like(params[k]) for k in keys}
+        self.second_moment_buf: dict[str, mx.array | None] = {k: None for k in keys}
+
+    def step(
+        self,
+        params: dict[str, mx.array],
+        grads: dict[str, mx.array],
+        step: int,
+        lr_mul: float,
+    ) -> dict[str, mx.array]:
+        # Momentum warmup (same schedule as Muon).
+        if self.args.muon_momentum_warmup_steps:
+            t = min(step / self.args.muon_momentum_warmup_steps, 1.0)
+            momentum = (1.0 - t) * self.args.muon_momentum_warmup_start + t * self.args.nor_muon_momentum
+        else:
+            momentum = self.args.nor_muon_momentum
+
+        lr = self.args.nor_muon_learning_rate * lr_mul
+        wd = self.args.nor_muon_weight_decay
+        beta2 = self.args.nor_muon_beta2
+
+        out: dict[str, mx.array] = {}
+        for k in self.keys:
+            p = params[k]
+            g = grads[k]
+
+            # Decoupled weight decay (scaled by schedule, not base LR).
+            if wd > 0:
+                p = p * (1.0 - wd * lr_mul)
+
+            # EMA momentum: buf = momentum * buf + (1 - momentum) * grad
+            buf = self.momentum_buf[k]
+            buf = buf + (1.0 - momentum) * (g - buf)
+            self.momentum_buf[k] = buf
+
+            # Blend current gradient toward momentum buffer (Nesterov-like).
+            g_eff = g + momentum * (buf - g)
+
+            # Newton-Schulz orthogonalization.
+            v = zeropower_newtonschulz5(g_eff, self.args.muon_backend_steps)
+
+            # --- Per-row/column second-moment normalization ---
+            vnorm = mx.sqrt(mx.sum(v * v) + 1e-10)
+
+            # Tall matrices: normalize per row; wide matrices: normalize per column.
+            if p.shape[0] >= p.shape[1]:
+                v_mean = mx.mean(v * v, axis=-1, keepdims=True)
+            else:
+                v_mean = mx.mean(v * v, axis=-2, keepdims=True)
+
+            # EMA of per-row/column second moments.
+            if self.second_moment_buf[k] is None:
+                self.second_moment_buf[k] = v_mean
+            else:
+                self.second_moment_buf[k] = self.second_moment_buf[k] + (1.0 - beta2) * (
+                    v_mean - self.second_moment_buf[k]
+                )
+
+            # Normalize by sqrt of second moment, then restore original Frobenius norm.
+            step_size = 1.0 / mx.sqrt(mx.maximum(self.second_moment_buf[k], 1e-10))
+            v = v * step_size
+            vnorm_new = mx.sqrt(mx.sum(v * v) + 1e-10)
+            v = v * (vnorm / vnorm_new)
+
+            # Shape-aware scaling and parameter update.
+            scale = math.sqrt(max(1.0, float(p.shape[0]) / float(p.shape[1])))
+            out[k] = p - lr * (v * scale).astype(p.dtype)
+
+        return out
 
 
 
@@ -563,7 +642,10 @@ class SplitOptimizers:
             if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
-        self.muon = Muon(self.matrix_keys, params, args)
+        if args.use_normuon:
+            self.muon = NorMuon(self.matrix_keys, params, args)
+        else:
+            self.muon = Muon(self.matrix_keys, params, args)
         self.adam_embed = optim.Adam(
             learning_rate=args.tied_embed_lr,
             betas=[args.beta1, args.beta2],
@@ -966,6 +1048,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        num_unique_layers=args.num_unique_layers,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1002,6 +1085,7 @@ def main() -> None:
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+        f"unique_layers:{model.num_unique_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
@@ -1012,11 +1096,14 @@ def main() -> None:
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
+    opt_name = "normuon+adam" if args.use_normuon else "muon+adam"
     log(
-        f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
+        f"optimizer:{opt_name} matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
         f"embed_lr:{args.tied_embed_lr} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+        f"matrix_lr:{args.nor_muon_learning_rate if args.use_normuon else args.matrix_lr} "
+        f"scalar_lr:{args.scalar_lr} "
+        f"momentum:{args.nor_muon_momentum if args.use_normuon else args.muon_momentum} "
+        f"muon_steps:{args.muon_backend_steps}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
