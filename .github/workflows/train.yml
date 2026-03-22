@@ -23,9 +23,9 @@ on:
         description: "Target host (derek or lexie). Leave empty for auto-assign."
         default: ""
 
-# ---- KEY RULE: one mini = one run at a time ----
-# Host SSH targets are stored in repo secrets (DEREK_SSH, LEXIE_SSH).
-# Concurrency groups keyed by host ensure only one run per mini. Others queue.
+# One mini = one run. Branch name determines which mini.
+# Same branch always goes to the same host for consistency.
+# Concurrency keyed by branch prevents collisions.
 
 env:
   PG_ROOT: /opt/parameter-golf
@@ -34,47 +34,10 @@ env:
   PG_DATA: /opt/parameter-golf/data
 
 jobs:
-  assign-host:
-    runs-on: [self-hosted, parameter-golf]
-    outputs:
-      host_ssh: ${{ steps.pick.outputs.host_ssh }}
-      host_name: ${{ steps.pick.outputs.host_name }}
-    steps:
-      - name: Pick host
-        id: pick
-        env:
-          DEREK_SSH: ${{ secrets.DEREK_SSH }}
-          LEXIE_SSH: ${{ secrets.LEXIE_SSH }}
-        run: |
-          REQUESTED="${{ inputs.host }}"
-          if [ "$REQUESTED" = "derek" ]; then
-            echo "host_ssh=$DEREK_SSH" >> $GITHUB_OUTPUT
-            echo "host_name=derek" >> $GITHUB_OUTPUT
-            exit 0
-          elif [ "$REQUESTED" = "lexie" ]; then
-            echo "host_ssh=$LEXIE_SSH" >> $GITHUB_OUTPUT
-            echo "host_name=lexie" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Auto-assign: hash the branch name to deterministically pick a host.
-          BRANCH="${GITHUB_REF_NAME}"
-          HASH=$(echo -n "$BRANCH" | md5sum | cut -c1-8)
-          HASH_NUM=$((16#$HASH))
-          if [ $((HASH_NUM % 2)) -eq 0 ]; then
-            echo "host_ssh=$DEREK_SSH" >> $GITHUB_OUTPUT
-            echo "host_name=derek" >> $GITHUB_OUTPUT
-          else
-            echo "host_ssh=$LEXIE_SSH" >> $GITHUB_OUTPUT
-            echo "host_name=lexie" >> $GITHUB_OUTPUT
-          fi
-          echo "Branch '$BRANCH' -> host (hash=$HASH)"
-
   train:
-    needs: assign-host
     runs-on: [self-hosted, parameter-golf]
     concurrency:
-      group: mini-${{ needs.assign-host.outputs.host_name }}
+      group: mini-${{ github.ref_name }}
       cancel-in-progress: false
     timeout-minutes: 30
 
@@ -82,10 +45,32 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Show assignment
+      - name: Resolve target host
+        id: host
+        env:
+          DEREK_SSH: ${{ secrets.DEREK_SSH }}
+          LEXIE_SSH: ${{ secrets.LEXIE_SSH }}
         run: |
-          echo "Branch: $GITHUB_REF_NAME"
-          echo "Host: ${{ needs.assign-host.outputs.host_name }}"
+          REQUESTED="${{ inputs.host }}"
+          if [ "$REQUESTED" = "derek" ]; then
+            echo "$DEREK_SSH" > /tmp/pg_target
+            echo "host_name=derek" >> $GITHUB_OUTPUT
+          elif [ "$REQUESTED" = "lexie" ]; then
+            echo "$LEXIE_SSH" > /tmp/pg_target
+            echo "host_name=lexie" >> $GITHUB_OUTPUT
+          else
+            BRANCH="${GITHUB_REF_NAME}"
+            HASH=$(echo -n "$BRANCH" | md5sum | cut -c1-8)
+            HASH_NUM=$((16#$HASH))
+            if [ $((HASH_NUM % 2)) -eq 0 ]; then
+              echo "$DEREK_SSH" > /tmp/pg_target
+              echo "host_name=derek" >> $GITHUB_OUTPUT
+            else
+              echo "$LEXIE_SSH" > /tmp/pg_target
+              echo "host_name=lexie" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "Branch '$GITHUB_REF_NAME' -> $( cat /tmp/pg_target | cut -d@ -f1 )"
 
       - name: Ensure shared dirs and venv (local)
         run: |
@@ -108,13 +93,12 @@ jobs:
           pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm zstandard
 
       - name: Sync code and data to target host
-        env:
-          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
           source "$PG_VENV/bin/activate"
+          TARGET=$(cat /tmp/pg_target)
           CHECKOUT_DIR="$(pwd)"
 
-          echo "--- Syncing to ${{ needs.assign-host.outputs.host_name }} ---"
+          echo "--- Syncing to ${{ steps.host.outputs.host_name }} ---"
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
             "sudo mkdir -p /opt/parameter-golf && sudo chown \$(whoami) /opt/parameter-golf && mkdir -p /opt/parameter-golf/work /opt/parameter-golf/data"
 
@@ -152,7 +136,6 @@ jobs:
             fi
           '
 
-          # Also sync locally
           rsync -a --delete \
             --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
             "$CHECKOUT_DIR/" "$PG_WORK/"
@@ -172,16 +155,16 @@ jobs:
       - name: Train (single host)
         env:
           PYTHONUNBUFFERED: "1"
-          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
           set -o pipefail
           source "$PG_VENV/bin/activate"
+          TARGET=$(cat /tmp/pg_target)
 
           RUN_ID="${{ inputs.run_id || github.sha }}"
           ITERATIONS="${{ inputs.iterations || '200' }}"
           BATCH="${{ inputs.train_batch_tokens || '8192' }}"
 
-          echo "Running on ${{ needs.assign-host.outputs.host_name }} — single host mode"
+          echo "Running on ${{ steps.host.outputs.host_name }} — single host mode"
 
           ssh -o StrictHostKeyChecking=no "$TARGET" "
             source /opt/parameter-golf/venv/bin/activate
@@ -199,11 +182,12 @@ jobs:
 
       - name: Collect and summarize
         if: always()
-        env:
-          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
+          TARGET=$(cat /tmp/pg_target 2>/dev/null || echo "")
           mkdir -p ./logs
-          scp -o StrictHostKeyChecking=no "$TARGET:/opt/parameter-golf/work/logs/*.txt" ./logs/ 2>/dev/null || true
+          if [ -n "$TARGET" ]; then
+            scp -o StrictHostKeyChecking=no "$TARGET:/opt/parameter-golf/work/logs/*.txt" ./logs/ 2>/dev/null || true
+          fi
           LOG=$(ls ./logs/*.txt 2>/dev/null | head -1)
 
           if [ -z "$LOG" ]; then
@@ -212,7 +196,7 @@ jobs:
           fi
 
           echo ""
-          echo "========== RESULTS (${{ needs.assign-host.outputs.host_name }}) =========="
+          echo "========== RESULTS (${{ steps.host.outputs.host_name }}) =========="
           grep -E "^model_params:|^iterations:|^optimizer:" "$LOG" 2>/dev/null || true
           echo "---"
           grep -E "^step:(1|10)/|^step:.*train_loss.*step_avg" "$LOG" | tail -3
@@ -223,7 +207,7 @@ jobs:
           echo "============================="
 
           {
-            echo "## Training Results (${{ needs.assign-host.outputs.host_name }})"
+            echo "## Training Results (${{ steps.host.outputs.host_name }})"
             echo '```'
             grep -E "^step:.*val_bpb|^final_" "$LOG" 2>/dev/null || echo "val_bpb not yet available"
             grep -E "^serialized_model|^swa:" "$LOG" 2>/dev/null || true
@@ -236,14 +220,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: train-log-${{ needs.assign-host.outputs.host_name }}-${{ github.sha }}
+          name: train-log-${{ steps.host.outputs.host_name }}-${{ github.sha }}
           path: logs/
 
       - name: Cleanup
         if: always()
-        env:
-          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
-            "rm -rf /opt/parameter-golf/work/logs" 2>/dev/null || true
-          rm -rf "$PG_WORK/logs"
+          TARGET=$(cat /tmp/pg_target 2>/dev/null || echo "")
+          if [ -n "$TARGET" ]; then
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
+              "rm -rf /opt/parameter-golf/work/logs" 2>/dev/null || true
+          fi
+          rm -rf "$PG_WORK/logs" /tmp/pg_target
