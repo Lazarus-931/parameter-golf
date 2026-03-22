@@ -24,8 +24,8 @@ on:
         default: ""
 
 # ---- KEY RULE: one mini = one run at a time ----
-# We pick a host (derek or lexie) and use concurrency groups keyed by host.
-# If a run is already active on that host, the new run QUEUES (cancel-in-progress: false).
+# Host SSH targets are stored in repo secrets (DEREK_SSH, LEXIE_SSH).
+# Concurrency groups keyed by host ensure only one run per mini. Others queue.
 
 env:
   PG_ROOT: /opt/parameter-golf
@@ -34,7 +34,6 @@ env:
   PG_DATA: /opt/parameter-golf/data
 
 jobs:
-  # Step 1: pick which host to use
   assign-host:
     runs-on: [self-hosted, parameter-golf]
     outputs:
@@ -43,39 +42,37 @@ jobs:
     steps:
       - name: Pick host
         id: pick
+        env:
+          DEREK_SSH: ${{ secrets.DEREK_SSH }}
+          LEXIE_SSH: ${{ secrets.LEXIE_SSH }}
         run: |
-          # If manually specified, use that
           REQUESTED="${{ inputs.host }}"
           if [ "$REQUESTED" = "derek" ]; then
-            echo "host_ssh=derek@100.64.169.42" >> $GITHUB_OUTPUT
+            echo "host_ssh=$DEREK_SSH" >> $GITHUB_OUTPUT
             echo "host_name=derek" >> $GITHUB_OUTPUT
             exit 0
           elif [ "$REQUESTED" = "lexie" ]; then
-            echo "host_ssh=lexie@100.77.36.51" >> $GITHUB_OUTPUT
+            echo "host_ssh=$LEXIE_SSH" >> $GITHUB_OUTPUT
             echo "host_name=lexie" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Auto-assign: hash the branch name to pick a host deterministically.
-          # This ensures the same branch always goes to the same host,
-          # and different branches spread across hosts.
+          # Auto-assign: hash the branch name to deterministically pick a host.
           BRANCH="${GITHUB_REF_NAME}"
           HASH=$(echo -n "$BRANCH" | md5sum | cut -c1-8)
           HASH_NUM=$((16#$HASH))
           if [ $((HASH_NUM % 2)) -eq 0 ]; then
-            echo "host_ssh=derek@100.64.169.42" >> $GITHUB_OUTPUT
+            echo "host_ssh=$DEREK_SSH" >> $GITHUB_OUTPUT
             echo "host_name=derek" >> $GITHUB_OUTPUT
           else
-            echo "host_ssh=lexie@100.77.36.51" >> $GITHUB_OUTPUT
+            echo "host_ssh=$LEXIE_SSH" >> $GITHUB_OUTPUT
             echo "host_name=lexie" >> $GITHUB_OUTPUT
           fi
-          echo "Branch '$BRANCH' assigned to host (hash=$HASH)"
+          echo "Branch '$BRANCH' -> host (hash=$HASH)"
 
-  # Step 2: run training on the assigned host
   train:
     needs: assign-host
     runs-on: [self-hosted, parameter-golf]
-    # CONCURRENCY: keyed by host name. Only ONE run per mini at a time. Others queue.
     concurrency:
       group: mini-${{ needs.assign-host.outputs.host_name }}
       cancel-in-progress: false
@@ -88,7 +85,7 @@ jobs:
       - name: Show assignment
         run: |
           echo "Branch: $GITHUB_REF_NAME"
-          echo "Host: ${{ needs.assign-host.outputs.host_name }} (${{ needs.assign-host.outputs.host_ssh }})"
+          echo "Host: ${{ needs.assign-host.outputs.host_name }}"
 
       - name: Ensure shared dirs and venv (local)
         run: |
@@ -109,16 +106,15 @@ jobs:
           source "$PG_VENV/bin/activate"
           pip install --upgrade pip
           pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm zstandard
-          echo "Python: $(python3 --version)"
-          echo "MLX: $(python3 -c 'import mlx.core as mx; print(mx.__version__)' 2>/dev/null || echo 'unknown')"
 
       - name: Sync code and data to target host
+        env:
+          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
           source "$PG_VENV/bin/activate"
-          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
           CHECKOUT_DIR="$(pwd)"
 
-          echo "--- Syncing to $TARGET ---"
+          echo "--- Syncing to ${{ needs.assign-host.outputs.host_name }} ---"
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
             "sudo mkdir -p /opt/parameter-golf && sudo chown \$(whoami) /opt/parameter-golf && mkdir -p /opt/parameter-golf/work /opt/parameter-golf/data"
 
@@ -155,7 +151,6 @@ jobs:
               ln -sfn $PG/data/tokenizers $PG/work/data/tokenizers
             fi
           '
-          echo "--- $TARGET ready ---"
 
           # Also sync locally
           rsync -a --delete \
@@ -177,20 +172,17 @@ jobs:
       - name: Train (single host)
         env:
           PYTHONUNBUFFERED: "1"
+          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
           set -o pipefail
           source "$PG_VENV/bin/activate"
-
-          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
-          HOST_NAME="${{ needs.assign-host.outputs.host_name }}"
 
           RUN_ID="${{ inputs.run_id || github.sha }}"
           ITERATIONS="${{ inputs.iterations || '200' }}"
           BATCH="${{ inputs.train_batch_tokens || '8192' }}"
 
-          echo "Running on $HOST_NAME ($TARGET) — single host mode"
+          echo "Running on ${{ needs.assign-host.outputs.host_name }} — single host mode"
 
-          # Run training via SSH on the assigned host
           ssh -o StrictHostKeyChecking=no "$TARGET" "
             source /opt/parameter-golf/venv/bin/activate
             cd /opt/parameter-golf/work
@@ -204,12 +196,12 @@ jobs:
             export PYTHONUNBUFFERED=1
             python3 -u train_gpt_mlx.py
           "
-          echo "Training exit code: $?"
 
       - name: Collect and summarize
         if: always()
+        env:
+          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
-          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
           mkdir -p ./logs
           scp -o StrictHostKeyChecking=no "$TARGET:/opt/parameter-golf/work/logs/*.txt" ./logs/ 2>/dev/null || true
           LOG=$(ls ./logs/*.txt 2>/dev/null | head -1)
@@ -249,9 +241,9 @@ jobs:
 
       - name: Cleanup
         if: always()
+        env:
+          TARGET: ${{ needs.assign-host.outputs.host_ssh }}
         run: |
-          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
             "rm -rf /opt/parameter-golf/work/logs" 2>/dev/null || true
-          rm -rf "$PG_WORK/logs" "$PG_WORK/hostfile.json"
-          echo "Cleaned up on ${{ needs.assign-host.outputs.host_name }}"
+          rm -rf "$PG_WORK/logs"
