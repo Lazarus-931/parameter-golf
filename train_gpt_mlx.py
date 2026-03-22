@@ -421,15 +421,19 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """SwiGLU MLP: SiLU(x @ W_gate) * (x @ W_up) then project down.
+    Uses 2/3 hidden size to keep param count comparable to 2-matrix relu^2 at same mlp_mult."""
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = int(dim * mlp_mult)
-        self.fc = CastedLinear(dim, hidden)
+        hidden = int(dim * mlp_mult * 2 / 3)
+        # Round to nearest multiple of 64 for efficiency
+        hidden = ((hidden + 63) // 64) * 64
+        self.w_gate = CastedLinear(dim, hidden)
+        self.w_up = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        return self.proj(nn.silu(self.w_gate(x)) * self.w_up(x))
 
 
 class SmearGate(nn.Module):
@@ -532,7 +536,7 @@ class GPT(nn.Module):
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
-            for lin in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.mlp.fc]:
+            for lin in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.mlp.w_gate, b.mlp.w_up]:
                 w = lin.weight
                 if w.ndim == 2 and min(w.shape) >= 64:
                     u, _, vt = np.linalg.svd(np.random.randn(w.shape[0], w.shape[1]).astype(np.float32), full_matrices=False)
@@ -1242,15 +1246,12 @@ def main() -> None:
     elif swa_state is not None:
         log("swa:only 1 checkpoint collected, skipping averaging")
 
-    out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
-    mx.savez(str(out_path), **flat_state)
-    log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
     quant_obj, quant_stats = quantize_state_dict_mixed(flat_state, args.num_layers)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+        quant_blob = zstandard.ZstdCompressor(level=9).compress(quant_raw)
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
