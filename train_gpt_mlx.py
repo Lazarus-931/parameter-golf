@@ -401,9 +401,10 @@ class CausalSelfAttention(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        # Extra RMSNorm before each projection stabilizes activations for quantization
+        q = self.c_q(rms_norm(x)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(rms_norm(x)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(rms_norm(x)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
@@ -417,7 +418,7 @@ class CausalSelfAttention(nn.Module):
             y_t = self._xsa(y_t, v_t)
             y = y_t.transpose(0, 2, 1, 3)
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(rms_norm(y))
 
 
 class MLP(nn.Module):
@@ -428,8 +429,9 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        # Extra RMSNorm before fc projection
+        x = nn.relu(self.fc(rms_norm(x)))
+        return self.proj(rms_norm(x * x))
 
 
 class SmearGate(nn.Module):
