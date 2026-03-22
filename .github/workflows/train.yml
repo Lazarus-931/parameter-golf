@@ -1,4 +1,4 @@
-name: Distributed Train on Mac Minis
+name: Train on Mac Mini
 
 on:
   push:
@@ -19,13 +19,14 @@ on:
       run_id:
         description: "Run identifier"
         default: "ci_run"
-      profile_steps:
-        description: "Metal GPU trace: capture N training steps (0 = off)"
-        default: "0"
+      host:
+        description: "Target host (derek or lexie). Leave empty for auto-assign."
+        default: ""
 
-# All paths are absolute and identical on every Mac Mini.
-# This is required because mlx.launch uses the coordinator's Python
-# path on all remote hosts.
+# ---- KEY RULE: one mini = one run at a time ----
+# We pick a host (derek or lexie) and use concurrency groups keyed by host.
+# If a run is already active on that host, the new run QUEUES (cancel-in-progress: false).
+
 env:
   PG_ROOT: /opt/parameter-golf
   PG_VENV: /opt/parameter-golf/venv
@@ -33,21 +34,67 @@ env:
   PG_DATA: /opt/parameter-golf/data
 
 jobs:
-  distributed-train:
+  # Step 1: pick which host to use
+  assign-host:
     runs-on: [self-hosted, parameter-golf]
-    timeout-minutes: 120
+    outputs:
+      host_ssh: ${{ steps.pick.outputs.host_ssh }}
+      host_name: ${{ steps.pick.outputs.host_name }}
+    steps:
+      - name: Pick host
+        id: pick
+        run: |
+          # If manually specified, use that
+          REQUESTED="${{ inputs.host }}"
+          if [ "$REQUESTED" = "derek" ]; then
+            echo "host_ssh=derek@100.64.169.42" >> $GITHUB_OUTPUT
+            echo "host_name=derek" >> $GITHUB_OUTPUT
+            exit 0
+          elif [ "$REQUESTED" = "lexie" ]; then
+            echo "host_ssh=lexie@100.77.36.51" >> $GITHUB_OUTPUT
+            echo "host_name=lexie" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Auto-assign: hash the branch name to pick a host deterministically.
+          # This ensures the same branch always goes to the same host,
+          # and different branches spread across hosts.
+          BRANCH="${GITHUB_REF_NAME}"
+          HASH=$(echo -n "$BRANCH" | md5sum | cut -c1-8)
+          HASH_NUM=$((16#$HASH))
+          if [ $((HASH_NUM % 2)) -eq 0 ]; then
+            echo "host_ssh=derek@100.64.169.42" >> $GITHUB_OUTPUT
+            echo "host_name=derek" >> $GITHUB_OUTPUT
+          else
+            echo "host_ssh=lexie@100.77.36.51" >> $GITHUB_OUTPUT
+            echo "host_name=lexie" >> $GITHUB_OUTPUT
+          fi
+          echo "Branch '$BRANCH' assigned to host (hash=$HASH)"
+
+  # Step 2: run training on the assigned host
+  train:
+    needs: assign-host
+    runs-on: [self-hosted, parameter-golf]
+    # CONCURRENCY: keyed by host name. Only ONE run per mini at a time. Others queue.
+    concurrency:
+      group: mini-${{ needs.assign-host.outputs.host_name }}
+      cancel-in-progress: false
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Show assignment
+        run: |
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Host: ${{ needs.assign-host.outputs.host_name }} (${{ needs.assign-host.outputs.host_ssh }})"
+
       - name: Ensure shared dirs and venv (local)
         run: |
-          # Create shared dir if needed (setup-runner.sh should have done this)
           sudo mkdir -p "$PG_ROOT" && sudo chown "$(whoami)" "$PG_ROOT"
           mkdir -p "$PG_WORK" "$PG_DATA"
 
-          # Find python 3.10+
           if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
             PY=/opt/homebrew/bin/python3.12
           elif command -v python3.12 &>/dev/null; then
@@ -61,85 +108,59 @@ jobs:
           fi
           source "$PG_VENV/bin/activate"
           pip install --upgrade pip
-          pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm
+          pip install --upgrade mlx numpy sentencepiece huggingface-hub datasets tqdm zstandard
           echo "Python: $(python3 --version)"
           echo "MLX: $(python3 -c 'import mlx.core as mx; print(mx.__version__)' 2>/dev/null || echo 'unknown')"
-          which mlx.launch
 
-      - name: Sync code and data to all hosts
+      - name: Sync code and data to target host
         run: |
           source "$PG_VENV/bin/activate"
-          HOSTFILE="cluster/hostfile.json"
-
-          SSH_TARGETS=$(python3 -c "
-          import json
-          with open('$HOSTFILE') as f:
-              hosts = json.load(f)
-          for h in hosts:
-              print(h['ssh'])
-          ")
-
+          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
           CHECKOUT_DIR="$(pwd)"
 
-          for TARGET in $SSH_TARGETS; do
-            echo "--- Syncing to $TARGET ---"
+          echo "--- Syncing to $TARGET ---"
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
+            "sudo mkdir -p /opt/parameter-golf && sudo chown \$(whoami) /opt/parameter-golf && mkdir -p /opt/parameter-golf/work /opt/parameter-golf/data"
 
-            # Create shared dirs on remote (needs sudo the first time)
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
-              "sudo mkdir -p /opt/parameter-golf && sudo chown \$(whoami) /opt/parameter-golf && mkdir -p /opt/parameter-golf/work /opt/parameter-golf/data"
+          rsync -az --delete \
+            --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            "$CHECKOUT_DIR/" "$TARGET:/opt/parameter-golf/work/"
 
-            # Sync code
-            rsync -az --delete \
-              --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
-              -e "ssh -o StrictHostKeyChecking=no" \
-              "$CHECKOUT_DIR/" "$TARGET:/opt/parameter-golf/work/"
-
-            # Ensure venv + dataset on remote
-            ssh -o StrictHostKeyChecking=no "$TARGET" '
-              PG=/opt/parameter-golf
-
-              # Find python 3.10+
-              if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
-                PY=/opt/homebrew/bin/python3.12
-              elif command -v python3.12 &>/dev/null; then
-                PY=python3.12
-              else
-                PY=python3
-              fi
-
-              # Venv at shared path
-              if [ ! -d $PG/venv ]; then
-                $PY -m venv $PG/venv
-                source $PG/venv/bin/activate
-                pip install --upgrade pip
-                pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
-              fi
+          ssh -o StrictHostKeyChecking=no "$TARGET" '
+            PG=/opt/parameter-golf
+            if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
+              PY=/opt/homebrew/bin/python3.12
+            elif command -v python3.12 &>/dev/null; then
+              PY=python3.12
+            else
+              PY=python3
+            fi
+            if [ ! -d $PG/venv ]; then
+              $PY -m venv $PG/venv
               source $PG/venv/bin/activate
+              pip install --upgrade pip
+              pip install mlx numpy sentencepiece huggingface-hub datasets tqdm zstandard
+            fi
+            source $PG/venv/bin/activate
+            if [ ! -d $PG/data/fineweb10B_sp1024 ]; then
+              cd $PG/work
+              python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
+              mv ./data/datasets/fineweb10B_sp1024 $PG/data/
+              cp -r ./data/tokenizers $PG/data/ 2>/dev/null || true
+            fi
+            mkdir -p $PG/work/data/datasets
+            ln -sfn $PG/data/fineweb10B_sp1024 $PG/work/data/datasets/fineweb10B_sp1024
+            if [ -d $PG/data/tokenizers ]; then
+              ln -sfn $PG/data/tokenizers $PG/work/data/tokenizers
+            fi
+          '
+          echo "--- $TARGET ready ---"
 
-              # Dataset
-              if [ ! -d $PG/data/fineweb10B_sp1024 ]; then
-                cd $PG/work
-                python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
-                mv ./data/datasets/fineweb10B_sp1024 $PG/data/
-                cp -r ./data/tokenizers $PG/data/ 2>/dev/null || true
-              fi
-
-              # Symlink data into work dir
-              mkdir -p $PG/work/data/datasets
-              ln -sfn $PG/data/fineweb10B_sp1024 $PG/work/data/datasets/fineweb10B_sp1024
-              if [ -d $PG/data/tokenizers ]; then
-                ln -sfn $PG/data/tokenizers $PG/work/data/tokenizers
-              fi
-            '
-            echo "--- $TARGET ready ---"
-          done
-
-          # Sync checked-out code to local work dir (runner may not be in hostfile)
+          # Also sync locally
           rsync -a --delete \
             --exclude '.git' --exclude '.venv' --exclude 'data/datasets' --exclude 'data/tokenizers' --exclude 'logs' \
             "$CHECKOUT_DIR/" "$PG_WORK/"
-
-          # Symlink data locally
           mkdir -p "$PG_WORK/data/datasets"
           if [ ! -d "$PG_DATA/fineweb10B_sp1024" ]; then
             cd "$PG_WORK"
@@ -153,64 +174,44 @@ jobs:
             ln -sfn "$PG_DATA/tokenizers" "$PG_WORK/data/tokenizers"
           fi
 
-      - name: Distributed train
+      - name: Train (single host)
         env:
           PYTHONUNBUFFERED: "1"
         run: |
           set -o pipefail
           source "$PG_VENV/bin/activate"
 
-          NUM_HOSTS=$(python3 -c "import json; print(len(json.load(open('cluster/hostfile.json'))))")
-          echo "Launching distributed training across $NUM_HOSTS hosts"
-
-          cp cluster/hostfile.json "$PG_WORK/hostfile.json"
+          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
+          HOST_NAME="${{ needs.assign-host.outputs.host_name }}"
 
           RUN_ID="${{ inputs.run_id || github.sha }}"
           ITERATIONS="${{ inputs.iterations || '200' }}"
           BATCH="${{ inputs.train_batch_tokens || '8192' }}"
 
-          PROFILE_STEPS="${{ inputs.profile_steps || '0' }}"
+          echo "Running on $HOST_NAME ($TARGET) — single host mode"
 
-          export RUN_ID ITERATIONS
-          export TRAIN_BATCH_TOKENS="$BATCH"
-          export VAL_LOSS_EVERY=0
-          export VAL_BATCH_SIZE=8192
-          export GRAD_ACCUM_STEPS=1
-          export MLX_MAX_MICROBATCH_TOKENS=4096
-          export PROFILE_STEPS
-          export PROFILE_TRACE="$PG_WORK/training.gputrace"
-          if [ "$PROFILE_STEPS" -gt 0 ] 2>/dev/null; then
-            export MTL_CAPTURE_ENABLED=1
-          fi
-
-          cd "$PG_WORK"
-
-          if [ "$NUM_HOSTS" -gt 1 ]; then
-            # Multi-host: use mlx.launch to coordinate distributed training
-            mlx.launch \
-              --hostfile "$PG_WORK/hostfile.json" \
-              --backend ring \
-              --verbose \
-              --env "RUN_ID=$RUN_ID" \
-              --env "ITERATIONS=$ITERATIONS" \
-              --env "TRAIN_BATCH_TOKENS=$BATCH" \
-              --env "VAL_LOSS_EVERY=0" \
-              --env "VAL_BATCH_SIZE=8192" \
-              --env "GRAD_ACCUM_STEPS=1" \
-              --env "MLX_MAX_MICROBATCH_TOKENS=4096" \
-              "$PG_WORK/train_gpt_mlx.py"
-          else
-            # Single host: run directly, no mlx.launch overhead
-            echo "Single host mode — running directly"
-            python3 -u "$PG_WORK/train_gpt_mlx.py"
-          fi
-          echo "Training script exit code: $?"
+          # Run training via SSH on the assigned host
+          ssh -o StrictHostKeyChecking=no "$TARGET" "
+            source /opt/parameter-golf/venv/bin/activate
+            cd /opt/parameter-golf/work
+            export RUN_ID='$RUN_ID'
+            export ITERATIONS='$ITERATIONS'
+            export TRAIN_BATCH_TOKENS='$BATCH'
+            export VAL_LOSS_EVERY=0
+            export VAL_BATCH_SIZE=8192
+            export GRAD_ACCUM_STEPS=1
+            export MLX_MAX_MICROBATCH_TOKENS=4096
+            export PYTHONUNBUFFERED=1
+            python3 -u train_gpt_mlx.py
+          "
+          echo "Training exit code: $?"
 
       - name: Collect and summarize
         if: always()
         run: |
-          sync
-          cp -r "$PG_WORK/logs/" ./logs/ 2>/dev/null || true
+          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
+          mkdir -p ./logs
+          scp -o StrictHostKeyChecking=no "$TARGET:/opt/parameter-golf/work/logs/*.txt" ./logs/ 2>/dev/null || true
           LOG=$(ls ./logs/*.txt 2>/dev/null | head -1)
 
           if [ -z "$LOG" ]; then
@@ -219,23 +220,21 @@ jobs:
           fi
 
           echo ""
-          echo "========== RESULTS =========="
-          # Key metrics: config, final train loss, val_loss, val_bpb, model size
+          echo "========== RESULTS (${{ needs.assign-host.outputs.host_name }}) =========="
           grep -E "^model_params:|^iterations:|^optimizer:" "$LOG" 2>/dev/null || true
           echo "---"
           grep -E "^step:(1|10)/|^step:.*train_loss.*step_avg" "$LOG" | tail -3
           echo "---"
           grep -E "^step:.*val_loss.*val_bpb" "$LOG" 2>/dev/null || true
-          grep -E "^saved_model:|^serialized_model|^final_int8" "$LOG" 2>/dev/null || true
-          grep -E "^stopping_early" "$LOG" 2>/dev/null || true
+          grep -E "^saved_model:|^serialized_model|^final_" "$LOG" 2>/dev/null || true
+          grep -E "^stopping_early|^swa:" "$LOG" 2>/dev/null || true
           echo "============================="
 
-          # GitHub step summary
           {
-            echo "## Training Results"
+            echo "## Training Results (${{ needs.assign-host.outputs.host_name }})"
             echo '```'
-            grep -E "^step:.*val_bpb|^final_int8_zlib_roundtrip " "$LOG" 2>/dev/null || echo "val_bpb not yet available"
-            grep -E "^serialized_model" "$LOG" 2>/dev/null || true
+            grep -E "^step:.*val_bpb|^final_" "$LOG" 2>/dev/null || echo "val_bpb not yet available"
+            grep -E "^serialized_model|^swa:" "$LOG" 2>/dev/null || true
             echo ""
             echo "Steps: $(grep -c '^step:' "$LOG") | $(grep '^step:' "$LOG" | tail -1)"
             echo '```'
@@ -245,35 +244,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: train-log-${{ github.sha }}
+          name: train-log-${{ needs.assign-host.outputs.host_name }}-${{ github.sha }}
           path: logs/
 
-      - name: Upload GPU trace
-        if: always() && inputs.profile_steps != '0' && inputs.profile_steps != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-trace-${{ github.sha }}
-          path: ${{ env.PG_WORK }}/training.gputrace/
-
-      - name: Cleanup training artifacts
+      - name: Cleanup
         if: always()
         run: |
-          # Remove logs, model files, and traces from the coordinator
-          rm -rf "$PG_WORK/logs" "$PG_WORK/hostfile.json" "$PG_WORK/training.gputrace"
-
-          # Remove logs from all remote hosts
-          source "$PG_VENV/bin/activate"
-          HOSTFILE="cluster/hostfile.json"
-          SSH_TARGETS=$(python3 -c "
-          import json
-          with open('$HOSTFILE') as f:
-              hosts = json.load(f)
-          for h in hosts:
-              print(h['ssh'])
-          " 2>/dev/null || true)
-
-          for TARGET in $SSH_TARGETS; do
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
-              "rm -rf /opt/parameter-golf/work/logs" 2>/dev/null || true
-          done
-          echo "Cleaned up training artifacts from all hosts"
+          TARGET="${{ needs.assign-host.outputs.host_ssh }}"
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$TARGET" \
+            "rm -rf /opt/parameter-golf/work/logs" 2>/dev/null || true
+          rm -rf "$PG_WORK/logs" "$PG_WORK/hostfile.json"
+          echo "Cleaned up on ${{ needs.assign-host.outputs.host_name }}"
