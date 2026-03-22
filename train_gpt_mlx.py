@@ -1244,15 +1244,12 @@ def main() -> None:
     elif swa_state is not None:
         log("swa:only 1 checkpoint collected, skipping averaging")
 
-    out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
-    mx.savez(str(out_path), **flat_state)
-    log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
     quant_obj, quant_stats = quantize_state_dict_mixed(flat_state, args.num_layers)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+        quant_blob = zstandard.ZstdCompressor(level=9).compress(quant_raw)
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
