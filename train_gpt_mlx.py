@@ -177,9 +177,12 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 FP16_KEEP_NAME_PATTERNS = tuple(
     pattern
-    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb").split(",")
+    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "").split(",")
     if pattern
 )
+# Entropy-Weighted Vocabulary Rescue: keep top-K most sensitive vocab rows in fp16,
+# quantize the rest to int6. Saves ~800KB vs full fp16 embedding.
+VOCAB_RESCUE_TOP_K = int(os.environ.get("VOCAB_RESCUE_TOP_K", 128))
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -749,6 +752,29 @@ def quantize_state_dict_mixed(flat_state: dict[str, mx.array], num_layers: int) 
             passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
             stats["int8_payload_bytes"] += int(fp16.nbytes)
             continue
+        # Entropy-Weighted Vocabulary Rescue: split embedding into sensitive (fp16) + quantized (int6)
+        if name == "tok_emb.weight" and VOCAB_RESCUE_TOP_K > 0 and f32.ndim == 2:
+            row_norms = np.linalg.norm(f32, axis=1)
+            row_var = np.var(f32, axis=1)
+            sensitivity = row_norms * row_var  # proxy for quantization sensitivity
+            top_k = min(VOCAB_RESCUE_TOP_K, f32.shape[0])
+            rescue_indices = np.argsort(sensitivity)[-top_k:]
+            rescue_mask = np.zeros(f32.shape[0], dtype=np.bool_)
+            rescue_mask[rescue_indices] = True
+            # Store rescue rows in fp16
+            result[name + ".rescue_indices"] = np.ascontiguousarray(rescue_indices.astype(np.int32))
+            result[name + ".rescue_rows"] = np.ascontiguousarray(f32[rescue_mask].astype(np.float16))
+            # Quantize remaining rows to int6
+            remaining = f32.copy()
+            remaining[rescue_mask] = 0.0  # zero out rescued rows (will be restored)
+            q, s = quantize_intN_per_row(remaining, clip_range=31)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "vocab_rescue", "top_k": top_k}
+            passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
+            stats["num_float_tensors"] += 1
+            stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes + result[name + ".rescue_rows"].nbytes + rescue_indices.nbytes * 4)
+            continue
         stats["num_float_tensors"] += 1
         clip = 15 if cat == "mlp" else 31
         q, s = quantize_intN_per_row(f32, clip_range=clip)
@@ -776,6 +802,18 @@ def dequantize_state_dict_mixed(quant_obj: dict[str, object], template_state: di
                 out[name] = mx.array(arr_np, dtype=orig.dtype)
             else:
                 out[name] = mx.array(arr_np)
+            continue
+        if isinstance(info, dict) and info.get("type") == "vocab_rescue":
+            # Restore quantized base + fp16 rescue rows
+            q = np.asarray(result[name + ".q"], dtype=np.int8)
+            s = np.asarray(result[name + ".scale"], dtype=np.float32)
+            out_arr = q.astype(np.float32) * s.reshape((q.shape[0],) + (1,) * (q.ndim - 1))
+            rescue_idx = np.asarray(result[name + ".rescue_indices"], dtype=np.int32)
+            rescue_rows = np.asarray(result[name + ".rescue_rows"], dtype=np.float32)
+            out_arr[rescue_idx] = rescue_rows
+            orig_name = passthrough_orig_dtypes.get(name) if isinstance(passthrough_orig_dtypes, dict) else None
+            dt = MX_DTYPE_FROM_NAME.get(orig_name, orig.dtype) if isinstance(orig_name, str) else orig.dtype
+            out[name] = mx.array(out_arr, dtype=dt)
             continue
         q = np.asarray(result[name + ".q"], dtype=np.int8)
         s = np.asarray(result[name + ".scale"], dtype=np.float32)
