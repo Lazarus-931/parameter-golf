@@ -226,8 +226,88 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
 
-# Fused Metal kernel: B[i,j] = b*A[i,j] + c*A2[i,j] (elementwise on M×M matrices)
-# Eliminates 2 dispatches per NS iteration (scalar mul + add).
+# ==============================================================================
+# CUSTOM METAL KERNELS
+# ==============================================================================
+
+# Fused relu²: out = max(0, x)² in one pass (saves 1 dispatch vs relu then square).
+_RELU_SQ_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (idx >= inp_shape[0] * inp_shape[1] * inp_shape[2]) return;
+    float v = (float)inp[idx];
+    v = v > 0.0f ? v : 0.0f;
+    out[idx] = (T)(v * v);
+"""
+
+_relu_sq_kernel = mx.fast.metal_kernel(
+    name="relu_squared",
+    input_names=["inp"],
+    output_names=["out"],
+    source=_RELU_SQ_SOURCE,
+)
+
+
+def relu_squared(x: mx.array) -> mx.array:
+    """Fused relu² via Metal kernel."""
+    total = 1
+    for s in x.shape:
+        total *= s
+    padded = x.reshape(-1) if x.ndim != 3 else x
+    tg = min(256, total)
+    grid = (total + tg - 1) // tg * tg
+    out = _relu_sq_kernel(
+        inputs=[padded],
+        template=[("T", x.dtype)],
+        output_shapes=[padded.shape],
+        output_dtypes=[x.dtype],
+        grid=(grid, 1, 1),
+        threadgroup=(tg, 1, 1),
+    )[0]
+    return out.reshape(x.shape) if x.ndim != 3 else out
+
+
+# Fused SmearGate: out = (1-g)*x + g*x_prev where x_prev is x shifted right by 1 in seq dim.
+# Saves 3 dispatches (concat, 2 multiplies, add) into 1 kernel.
+_SMEARGATE_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    uint B = inp_shape[0], T = inp_shape[1], D = inp_shape[2];
+    uint total = B * T * D;
+    if (idx >= total) return;
+    uint d = idx % D;
+    uint t = (idx / D) % T;
+    uint b = idx / (T * D);
+    float g = 1.0f / (1.0f + exp(-(float)gate[d]));  // sigmoid
+    float cur = (float)inp[idx];
+    float prev = (t > 0) ? (float)inp[b * T * D + (t - 1) * D + d] : 0.0f;
+    out[idx] = (T2)((1.0f - g) * cur + g * prev);
+"""
+
+_smeargate_kernel = mx.fast.metal_kernel(
+    name="smeargate_fused",
+    input_names=["inp", "gate"],
+    output_names=["out"],
+    source=_SMEARGATE_SOURCE,
+)
+
+
+def smeargate_fused(x: mx.array, gate: mx.array) -> mx.array:
+    """Fused SmearGate via Metal kernel."""
+    total = 1
+    for s in x.shape:
+        total *= s
+    tg = min(256, total)
+    grid = (total + tg - 1) // tg * tg
+    return _smeargate_kernel(
+        inputs=[x, gate],
+        template=[("T2", x.dtype)],
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+        grid=(grid, 1, 1),
+        threadgroup=(tg, 1, 1),
+    )[0]
+
+
+# Fused NS B-matrix: B[i,j] = b*A[i,j] + c*A²[i,j] (elementwise on M×M matrices).
 _NS_BMAT_SOURCE = """
     uint idx = thread_position_in_grid.x;
     uint total = a_mat_shape[0] * a_mat_shape[0];
@@ -380,7 +460,6 @@ class CastedLinear(nn.Module):
 
 
 class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
     def __call__(self, x: mx.array) -> mx.array:
         return rms_norm(x)
 
@@ -456,8 +535,7 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        return self.proj(relu_squared(self.fc(x)))
 
 
 class SmearGate(nn.Module):
@@ -467,9 +545,7 @@ class SmearGate(nn.Module):
         self.gate = mx.zeros((dim,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        g = mx.sigmoid(self.gate.astype(x.dtype))[None, None, :]
-        x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
-        return (1 - g) * x + g * x_prev
+        return smeargate_fused(x, self.gate)
 
 
 class BigramHashEmbedding(nn.Module):
