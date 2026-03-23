@@ -1147,7 +1147,7 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if not args.skip_val and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if not args.skip_val and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
