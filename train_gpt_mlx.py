@@ -226,20 +226,47 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
 
+# Fused Metal kernel: B[i,j] = b*A[i,j] + c*A2[i,j] (elementwise on M×M matrices)
+# Eliminates 2 dispatches per NS iteration (scalar mul + add).
+_NS_BMAT_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    uint total = a_mat_shape[0] * a_mat_shape[0];
+    if (idx >= total) return;
+    out[idx] = -4.7750f * a_mat[idx] + 2.0315f * a_mat_sq[idx];
+"""
+
+_ns_bmat_kernel = mx.fast.metal_kernel(
+    name="ns_bmat",
+    input_names=["a_mat", "a_mat_sq"],
+    output_names=["out"],
+    source=_NS_BMAT_SOURCE,
+)
+
+
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
-    # Background on Muon: https://kellerjordan.github.io/posts/muon/
-    a, b, c = 3.4445, -4.7750, 2.0315
+    # Orthogonalize a 2D update matrix with Newton-Schulz iteration.
+    # Fused Metal kernel for B = b*A + c*A² (elementwise), MLX matmul for the rest.
+    a_coeff = 3.4445
     x = g.astype(mx.float32)
     x = x / (mx.sqrt(mx.sum(x * x)) + eps)
     transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
+    M, N = x.shape
+    total_elems = M * M
+    tg_size = min(256, total_elems)
+    grid_size = (total_elems + tg_size - 1) // tg_size * tg_size
     for _ in range(steps):
         a_mat = x @ x.T
-        b_mat = b * a_mat + c * (a_mat @ a_mat)
-        x = a * x + b_mat @ x
+        a_mat_sq = a_mat @ a_mat
+        b_mat = _ns_bmat_kernel(
+            inputs=[a_mat, a_mat_sq],
+            output_shapes=[(M, M)],
+            output_dtypes=[mx.float32],
+            grid=(grid_size, 1, 1),
+            threadgroup=(tg_size, 1, 1),
+        )[0]
+        x = a_coeff * x + b_mat @ x
     if transposed:
         x = x.T
     return x.astype(g.dtype)

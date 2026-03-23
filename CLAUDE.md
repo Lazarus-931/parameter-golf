@@ -28,6 +28,19 @@ Primary development branch for parameter-golf competition. Clean focused techniq
 ## Workflow
 - Minis derek/lexie, secrets DEREK_SSH/LEXIE_SSH. SKIP_VAL=1 (~7 min). Timeout 360m
 
-## Results (200 steps): train_loss ~4.26, val_bpb ~2.49, 1319ms/step
+## Results (200 steps, single Mac Mini)
 
-## Next: Metal kernels (fused NS, RMSNorm+linear, relu²), TTT, CPU/GPU overlap
+### var6-clean-int6 (this branch)
+- train_loss: 4.2627, val_bpb: 2.4944, step_avg: 1319ms, tok/s: 6161
+- serialized: 15,051,865 bytes (zstd), SWA: 1 checkpoint (barely kicked in at 200 steps)
+
+### var2-xsa (comparison baseline)
+- train_loss: 4.0278, val_bpb: 3.1403, step_avg: 1319ms, tok/s: 6204
+- serialized: 13,513,101 bytes (zstd), SWA: 4 checkpoints
+
+**Key insight**: var6 has higher train_loss but much lower val_bpb (2.49 vs 3.14). The muP scaling + uniform int6 quantization produce weights that survive quantization much better. var2's mixed int5/int6 damages MLP weights more aggressively.
+
+## Custom Metal Kernels
+- **Fused NS B-matrix**: `B = b*A + c*A²` computed in one Metal dispatch instead of 3 MLX ops. 10% speedup on NS, ~1-2% total step time.
+
+## Next: more Metal kernels (fused relu², fused RMSNorm), TTT, CPU/GPU overlap
