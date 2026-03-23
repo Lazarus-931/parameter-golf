@@ -230,81 +230,17 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
 # CUSTOM METAL KERNELS
 # ==============================================================================
 
-# Fused relu²: out = max(0, x)² in one pass (saves 1 dispatch vs relu then square).
-_RELU_SQ_SOURCE = """
-    uint idx = thread_position_in_grid.x;
-    if (idx >= inp_shape[0] * inp_shape[1] * inp_shape[2]) return;
-    float v = (float)inp[idx];
-    v = v > 0.0f ? v : 0.0f;
-    out[idx] = (T)(v * v);
-"""
-
-_relu_sq_kernel = mx.fast.metal_kernel(
-    name="relu_squared",
-    input_names=["inp"],
-    output_names=["out"],
-    source=_RELU_SQ_SOURCE,
-)
-
-
+# Fused relu²: out = max(0, x)² — standard ops (custom kernels don't support autodiff).
 def relu_squared(x: mx.array) -> mx.array:
-    """Fused relu² via Metal kernel."""
-    total = 1
-    for s in x.shape:
-        total *= s
-    padded = x.reshape(-1) if x.ndim != 3 else x
-    tg = min(256, total)
-    grid = (total + tg - 1) // tg * tg
-    out = _relu_sq_kernel(
-        inputs=[padded],
-        template=[("T", x.dtype)],
-        output_shapes=[padded.shape],
-        output_dtypes=[x.dtype],
-        grid=(grid, 1, 1),
-        threadgroup=(tg, 1, 1),
-    )[0]
-    return out.reshape(x.shape) if x.ndim != 3 else out
+    r = nn.relu(x)
+    return r * r
 
 
-# Fused SmearGate: out = (1-g)*x + g*x_prev where x_prev is x shifted right by 1 in seq dim.
-# Saves 3 dispatches (concat, 2 multiplies, add) into 1 kernel.
-_SMEARGATE_SOURCE = """
-    uint idx = thread_position_in_grid.x;
-    uint B = inp_shape[0], T = inp_shape[1], D = inp_shape[2];
-    uint total = B * T * D;
-    if (idx >= total) return;
-    uint d = idx % D;
-    uint t = (idx / D) % T;
-    uint b = idx / (T * D);
-    float g = 1.0f / (1.0f + exp(-(float)gate[d]));  // sigmoid
-    float cur = (float)inp[idx];
-    float prev = (t > 0) ? (float)inp[b * T * D + (t - 1) * D + d] : 0.0f;
-    out[idx] = (T2)((1.0f - g) * cur + g * prev);
-"""
-
-_smeargate_kernel = mx.fast.metal_kernel(
-    name="smeargate_fused",
-    input_names=["inp", "gate"],
-    output_names=["out"],
-    source=_SMEARGATE_SOURCE,
-)
-
-
+# Fused SmearGate: out = (1-g)*x + g*x_prev — standard ops for autodiff compatibility.
 def smeargate_fused(x: mx.array, gate: mx.array) -> mx.array:
-    """Fused SmearGate via Metal kernel."""
-    total = 1
-    for s in x.shape:
-        total *= s
-    tg = min(256, total)
-    grid = (total + tg - 1) // tg * tg
-    return _smeargate_kernel(
-        inputs=[x, gate],
-        template=[("T2", x.dtype)],
-        output_shapes=[x.shape],
-        output_dtypes=[x.dtype],
-        grid=(grid, 1, 1),
-        threadgroup=(tg, 1, 1),
-    )[0]
+    g = mx.sigmoid(gate.astype(x.dtype))[None, None, :]
+    x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+    return (1 - g) * x + g * x_prev
 
 
 # Fused NS B-matrix: B[i,j] = b*A[i,j] + c*A²[i,j] (elementwise on M×M matrices).
@@ -528,14 +464,18 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """SwiGLU MLP: SiLU(x @ W_gate) * (x @ W_up) then project down.
+    Uses 2/3 hidden size to keep param count comparable to 2-matrix relu^2 at same mlp_mult."""
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = int(dim * mlp_mult)
-        self.fc = CastedLinear(dim, hidden)
+        hidden = int(dim * mlp_mult * 2 / 3)
+        hidden = ((hidden + 63) // 64) * 64
+        self.w_gate = CastedLinear(dim, hidden)
+        self.w_up = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.proj(relu_squared(self.fc(x)))
+        return self.proj(nn.silu(self.w_gate(x)) * self.w_up(x))
 
 
 class SmearGate(nn.Module):
@@ -545,7 +485,9 @@ class SmearGate(nn.Module):
         self.gate = mx.zeros((dim,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return smeargate_fused(x, self.gate)
+        g = mx.sigmoid(self.gate.astype(x.dtype))[None, None, :]
+        x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        return (1 - g) * x + g * x_prev
 
 
 class BigramHashEmbedding(nn.Module):
@@ -640,7 +582,7 @@ class GPT(nn.Module):
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
             b.attn_scale = mx.full(b.attn_scale.shape, mup_scale, dtype=mx.float32)
             b.mlp_scale = mx.full(b.mlp_scale.shape, mup_scale, dtype=mx.float32)
-            for lin in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.mlp.fc]:
+            for lin in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.mlp.w_gate, b.mlp.w_up]:
                 w = lin.weight
                 if w.ndim == 2 and min(w.shape) >= 64:
                     u, _, vt = np.linalg.svd(np.random.randn(w.shape[0], w.shape[1]).astype(np.float32), full_matrices=False)
