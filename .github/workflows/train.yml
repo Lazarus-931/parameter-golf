@@ -173,7 +173,7 @@ jobs:
             export ITERATIONS='$ITERATIONS'
             export TRAIN_BATCH_TOKENS='$BATCH'
             export VAL_LOSS_EVERY=0
-            export VAL_BATCH_SIZE=8192
+            export VAL_BATCH_SIZE=524288
             export GRAD_ACCUM_STEPS=1
             export MLX_MAX_MICROBATCH_TOKENS=4096
             export PYTHONUNBUFFERED=1
