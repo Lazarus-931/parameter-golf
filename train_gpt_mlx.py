@@ -116,7 +116,7 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 0))
     eval_stride: int = int(os.environ.get("EVAL_STRIDE", 0))
 
     # Optimizer.
@@ -130,17 +130,17 @@ class Hyperparameters:
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
-    weight_decay: float = float(os.environ.get("WEIGHT_DECAY", 0.04))
+    weight_decay: float = float(os.environ.get("WEIGHT_DECAY", 0.02))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
     # BigramHash embedding.
-    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
 
     # Stochastic Weight Averaging.
     swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_start_frac: float = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every: int = int(os.environ.get("SWA_EVERY", 50))
+    swa_start_frac: float = float(os.environ.get("SWA_START_FRAC", 0.5))
+    swa_every: int = int(os.environ.get("SWA_EVERY", 200))
 
     out_dir: str = _default_path("OUT_DIR", "logs")
 
@@ -530,9 +530,13 @@ class GPT(nn.Module):
         self.final_norm = RMSNormNoWeight()
 
         # Orthogonal init for large weight matrices, zero-init for output projections.
+        # muP scaling: output projection residual scaled by 1/√(2·num_layers)
+        mup_scale = 1.0 / math.sqrt(2.0 * num_layers)
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            b.attn_scale = mx.full(b.attn_scale.shape, mup_scale, dtype=mx.float32)
+            b.mlp_scale = mx.full(b.mlp_scale.shape, mup_scale, dtype=mx.float32)
             for lin in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.mlp.fc]:
                 w = lin.weight
                 if w.ndim == 2 and min(w.shape) >= 64:
@@ -651,13 +655,13 @@ class SplitOptimizers:
             learning_rate=args.tied_embed_lr,
             betas=[args.beta1, args.beta2],
             eps=args.adam_eps,
-            weight_decay=args.weight_decay,
+            weight_decay=0.01,
         )
         self.adam_scalar = optim.AdamW(
             learning_rate=args.scalar_lr,
             betas=[args.beta1, args.beta2],
             eps=args.adam_eps,
-            weight_decay=args.weight_decay,
+            weight_decay=0.01,
         )
 
     def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
@@ -722,7 +726,6 @@ def quantize_state_dict_mixed(flat_state: dict[str, mx.array], num_layers: int) 
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += int(arr.nbytes)
         f32 = _np_float32(arr)
-        cat = _classify_param(name)
         if not mx.issubdtype(arr.dtype, mx.floating):
             stats["num_nonfloat_tensors"] += 1
             result[name] = np.ascontiguousarray(np.array(arr))
@@ -751,9 +754,8 @@ def quantize_state_dict_mixed(flat_state: dict[str, mx.array], num_layers: int) 
             stats["int8_payload_bytes"] += int(fp16.nbytes)
             continue
         stats["num_float_tensors"] += 1
-        clip = 15 if cat == "mlp" else 31
-        q, s = quantize_intN_per_row(f32, clip_range=clip)
-        meta[name] = {"type": f"int{5 if cat == 'mlp' else 6}"}
+        q, s = quantize_intN_per_row(f32, clip_range=31)
+        meta[name] = {"type": "int6"}
         result[name + ".q"] = q
         result[name + ".scale"] = s
         stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
@@ -1248,7 +1250,7 @@ def main() -> None:
     quant_obj, quant_stats = quantize_state_dict_mixed(flat_state, args.num_layers)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=9).compress(quant_raw)
+        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
