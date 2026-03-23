@@ -85,6 +85,7 @@ class Hyperparameters:
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
+    skip_val: bool = os.environ.get("SKIP_VAL", "0") == "1"
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
@@ -1180,7 +1181,7 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if not args.skip_val and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
