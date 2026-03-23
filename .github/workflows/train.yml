@@ -39,7 +39,7 @@ jobs:
     concurrency:
       group: mini-${{ github.ref_name }}
       cancel-in-progress: false
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     steps:
       - name: Checkout code
