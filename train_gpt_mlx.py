@@ -109,7 +109,7 @@ class Hyperparameters:
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: float = float(os.environ.get("MLP_MULT", 3))
+    mlp_mult: float = float(os.environ.get("MLP_MULT", 3.19))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -223,7 +223,7 @@ def accumulate_flat_grads(
 # ==============================================================================
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
-    return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+    return mx.fast.rms_norm(x, weight=None, eps=eps)
 
 
 # ==============================================================================
@@ -939,44 +939,91 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
-    if val_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
-            f"TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    val_batch_seqs = val_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
-    total_loss_sum = 0.0
-    total_tokens = 0.0
-    total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
-        batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
-        chunk = val_tokens[raw_start:raw_end]
-        x_np = chunk[:-1].reshape(-1, args.train_seq_len)
-        y_np = chunk[1:].reshape(-1, args.train_seq_len)
-        x = mx.array(x_np, dtype=mx.int32)
-        y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
-        prev_ids = x_np.reshape(-1)
-        tgt_ids = y_np.reshape(-1)
-        bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
-        bytes_np += (
-            has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
-        ).astype(np.int16, copy=False)
-        total_tokens += chunk_token_count
-        total_bytes += float(bytes_np.astype(np.float64).sum())
-        if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
-        ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+    #
+    # When EVAL_STRIDE > 0, uses overlapping windows so every scored token has
+    # at least (seq_len - stride) context tokens. Only the last `stride` tokens
+    # of each window contribute to the score (full window for the first chunk).
+    seq_len = args.train_seq_len
+    stride = args.eval_stride if args.eval_stride > 0 else seq_len
+    if stride > seq_len:
+        stride = seq_len
+
+    if stride == seq_len:
+        # Original non-overlapping path
+        val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+        if val_batch_tokens < seq_len:
+            raise ValueError(
+                "VAL_BATCH_SIZE must provide at least one sequence; "
+                f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
+                f"TRAIN_SEQ_LEN={seq_len}"
+            )
+        val_batch_seqs = val_batch_tokens // seq_len
+        total_seqs = (val_tokens.size - 1) // seq_len
+        total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
+        total_loss_sum = 0.0
+        total_tokens = 0.0
+        total_bytes = 0.0
+        for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+            batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
+            raw_start = batch_seq_start * seq_len
+            raw_end = batch_seq_end * seq_len + 1
+            chunk = val_tokens[raw_start:raw_end]
+            x_np = chunk[:-1].reshape(-1, seq_len)
+            y_np = chunk[1:].reshape(-1, seq_len)
+            x = mx.array(x_np, dtype=mx.int32)
+            y = mx.array(y_np, dtype=mx.int32)
+            chunk_token_count = float(y.size)
+            batch_loss = compiled_loss(x, y).astype(mx.float32)
+            mx.eval(batch_loss)
+            total_loss_sum += float(batch_loss.item()) * chunk_token_count
+            prev_ids = x_np.reshape(-1)
+            tgt_ids = y_np.reshape(-1)
+            bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
+            bytes_np += (
+                has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+            ).astype(np.int16, copy=False)
+            total_tokens += chunk_token_count
+            total_bytes += float(bytes_np.astype(np.float64).sum())
+            if log_fn is not None and total_batches > 1 and (
+                batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+            ):
+                log_fn(f"val_progress:{batch_idx}/{total_batches}")
+    else:
+        # Strided (overlapping) evaluation: each token gets more context.
+        n_tokens = val_tokens.size - 1
+        total_loss_sum = 0.0
+        total_tokens = 0.0
+        total_bytes = 0.0
+        window_starts = list(range(0, n_tokens - seq_len + 1, stride))
+        if not window_starts or window_starts[-1] + seq_len < n_tokens:
+            window_starts.append(max(n_tokens - seq_len, 0))
+        total_batches = len(window_starts)
+        if log_fn is not None:
+            log_fn(f"eval_stride:{stride} windows:{total_batches} (vs {n_tokens // seq_len} non-overlapping)")
+        for batch_idx, w in enumerate(window_starts, start=1):
+            chunk = val_tokens[w : w + seq_len + 1]
+            x_np = chunk[:-1].reshape(1, seq_len)
+            y_np = chunk[1:].reshape(1, seq_len)
+            x = mx.array(x_np, dtype=mx.int32)
+            y = mx.array(y_np, dtype=mx.int32)
+            score_start = 0 if w == 0 else seq_len - stride
+            score_count = seq_len - score_start
+            batch_loss = compiled_loss(x, y).astype(mx.float32)
+            mx.eval(batch_loss)
+            total_loss_sum += float(batch_loss.item()) * float(score_count)
+            prev_ids = x_np[0, score_start:]
+            tgt_ids = y_np[0, score_start:]
+            bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
+            bytes_np += (
+                has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+            ).astype(np.int16, copy=False)
+            total_tokens += float(score_count)
+            total_bytes += float(bytes_np.astype(np.float64).sum())
+            if log_fn is not None and total_batches > 1 and (
+                batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+            ):
+                log_fn(f"val_progress:{batch_idx}/{total_batches}")
+
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
