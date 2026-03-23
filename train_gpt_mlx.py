@@ -118,6 +118,13 @@ class Hyperparameters:
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 4))
     eval_stride: int = int(os.environ.get("EVAL_STRIDE", 0))
+    ttt_enable: bool = os.environ.get("TTT_ENABLE", "1") == "1"
+    ttt_chunk_size: int = int(os.environ.get("TTT_CHUNK_SIZE", 256))
+    ttt_num_layers: int = int(os.environ.get("TTT_NUM_LAYERS", 2))
+    ttt_rank: int = int(os.environ.get("TTT_RANK", 8))
+    ttt_alpha: float = float(os.environ.get("TTT_ALPHA", 16.0))
+    ttt_lr: float = float(os.environ.get("TTT_LR", 0.05))
+    ttt_steps: int = int(os.environ.get("TTT_STEPS", 1))
 
     # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -348,8 +355,9 @@ class CastedLinear(nn.Module):
         super().__init__()
         self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
+    def __call__(self, x: mx.array, adapter=None) -> mx.array:
+        y = x @ self.weight.astype(x.dtype).T
+        return y if adapter is None else y + adapter(x)
 
 
 class RMSNormNoWeight(nn.Module):
@@ -400,11 +408,11 @@ class CausalSelfAttention(nn.Module):
         proj = mx.sum(y_g * vn, axis=-1, keepdims=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, adapter=None) -> mx.array:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.c_q(x, None if adapter is None else adapter.c_q).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(x, None if adapter is None else adapter.c_k).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x, None if adapter is None else adapter.c_v).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
@@ -418,7 +426,7 @@ class CausalSelfAttention(nn.Module):
             y_t = self._xsa(y_t, v_t)
             y = y_t.transpose(0, 2, 1, 3)
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y, None if adapter is None else adapter.proj)
 
 
 class MLP(nn.Module):
@@ -433,8 +441,10 @@ class MLP(nn.Module):
         self.w_up = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.proj(nn.silu(self.w_gate(x)) * self.w_up(x))
+    def __call__(self, x: mx.array, adapter=None) -> mx.array:
+        gate = self.w_gate(x, None if adapter is None else adapter.w_gate)
+        up = self.w_up(x, None if adapter is None else adapter.w_up)
+        return self.proj(nn.silu(gate) * up, None if adapter is None else adapter.proj)
 
 
 class SmearGate(nn.Module):
@@ -495,12 +505,12 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, adapter=None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), None if adapter is None else adapter.attn)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), None if adapter is None else adapter.mlp)
         return x
 
 
@@ -553,7 +563,7 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, adapters=None) -> mx.array:
         x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -563,7 +573,7 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, None if adapters is None else adapters.block(i))
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -571,27 +581,81 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            j = self.num_encoder_layers + i
+            x = self.blocks[j](x, x0, None if adapters is None else adapters.block(j))
         return self.final_norm(x)
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+    def logits_from_hidden(self, x: mx.array, logit_adapter=None) -> mx.array:
+        logits = x @ self.tok_emb.weight.astype(x.dtype).T
+        if logit_adapter is not None:
+            logits = logits + logit_adapter(x)
+        return self.softcap(logits)
+
+    def token_losses(self, input_ids: mx.array, target_ids: mx.array, adapters=None, logit_adapter=None) -> mx.array:
+        if adapters is not None and logit_adapter is None:
+            logit_adapter = adapters.logit
+        x = self(input_ids, adapters=adapters).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
-
-        loss_sum = mx.array(0.0, dtype=mx.float32)
+            logits = self.logits_from_hidden(x, logit_adapter=logit_adapter)
+            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
+        losses: list[mx.array] = []
         n = int(x.shape[0])
         for s in range(0, n, self.logit_chunk_tokens):
             e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+            logits = self.logits_from_hidden(x[s:e], logit_adapter=logit_adapter)
+            losses.append(nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="none"))
+        return mx.concatenate(losses, axis=0)
+
+    def loss(self, input_ids: mx.array, target_ids: mx.array, adapters=None, logit_adapter=None) -> mx.array:
+        return mx.mean(self.token_losses(input_ids, target_ids, adapters=adapters, logit_adapter=logit_adapter))
+
+
+class LinearLoRA(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, rank: int, alpha: float):
+        super().__init__()
+        self.down = (mx.random.normal((rank, in_dim), dtype=mx.float32) / math.sqrt(in_dim)).astype(mx.float32)
+        self.up = mx.zeros((out_dim, rank), dtype=mx.float32)
+        self.scale = mx.array(alpha / max(rank, 1), dtype=mx.float32)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        z = hidden @ self.down.astype(hidden.dtype).T
+        return (z @ self.up.astype(hidden.dtype).T) * self.scale.astype(hidden.dtype)
+
+
+class TTTAttnAdapters(nn.Module):
+    def __init__(self, d: int, kv: int, rank: int, alpha: float):
+        super().__init__()
+        self.c_q = LinearLoRA(d, d, rank, alpha); self.c_k = LinearLoRA(d, kv, rank, alpha)
+        self.c_v = LinearLoRA(d, kv, rank, alpha); self.proj = LinearLoRA(d, d, rank, alpha)
+
+
+class TTTMLPAdapters(nn.Module):
+    def __init__(self, d: int, h: int, rank: int, alpha: float):
+        super().__init__()
+        self.w_gate = LinearLoRA(d, h, rank, alpha); self.w_up = LinearLoRA(d, h, rank, alpha)
+        self.proj = LinearLoRA(h, d, rank, alpha)
+
+
+class TTTBlockAdapters(nn.Module):
+    def __init__(self, block: Block, rank: int, alpha: float):
+        super().__init__()
+        d = block.attn.c_q.weight.shape[1]
+        kv = block.attn.c_k.weight.shape[0]
+        h = block.mlp.w_gate.weight.shape[0]
+        self.attn = TTTAttnAdapters(d, kv, rank, alpha)
+        self.mlp = TTTMLPAdapters(d, h, rank, alpha)
+
+
+class TTTAdapters(nn.Module):
+    def __init__(self, model: GPT, num_layers: int, rank: int, alpha: float):
+        super().__init__()
+        self.start = max(len(model.blocks) - max(num_layers, 0), 0)
+        self.blocks = [TTTBlockAdapters(model.blocks[i], rank, alpha) for i in range(self.start, len(model.blocks))]
+        self.logit = LinearLoRA(model.tok_emb.weight.shape[1], model.tok_emb.weight.shape[0], rank, alpha)
+
+    def block(self, idx: int):
+        return None if idx < self.start else self.blocks[idx - self.start]
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -887,6 +951,7 @@ def loss_and_grad_chunked(
 def eval_val(
     args: Hyperparameters,
     compiled_loss,
+    compiled_token_losses,
     val_tokens: np.ndarray,
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
@@ -951,6 +1016,7 @@ def eval_val(
         total_loss_sum = 0.0
         total_tokens = 0.0
         total_bytes = 0.0
+        scored_until = 0
         window_starts = list(range(0, n_tokens - seq_len + 1, stride))
         if not window_starts or window_starts[-1] + seq_len < n_tokens:
             window_starts.append(max(n_tokens - seq_len, 0))
@@ -963,24 +1029,92 @@ def eval_val(
             y_np = chunk[1:].reshape(1, seq_len)
             x = mx.array(x_np, dtype=mx.int32)
             y = mx.array(y_np, dtype=mx.int32)
-            score_start = 0 if w == 0 else seq_len - stride
-            score_count = seq_len - score_start
-            batch_loss = compiled_loss(x, y).astype(mx.float32)
-            mx.eval(batch_loss)
-            total_loss_sum += float(batch_loss.item()) * float(score_count)
-            prev_ids = x_np[0, score_start:]
-            tgt_ids = y_np[0, score_start:]
+            score_start = max(scored_until - w, 0)
+            score_end = min(n_tokens - w, seq_len)
+            score_count = score_end - score_start
+            if score_count <= 0:
+                continue
+            token_losses = compiled_token_losses(x, y).astype(mx.float32)
+            mx.eval(token_losses)
+            token_losses_np = _np_float32(token_losses).reshape(seq_len)
+            total_loss_sum += float(token_losses_np[score_start:score_end].astype(np.float64).sum())
+            prev_ids = x_np[0, score_start:score_end]
+            tgt_ids = y_np[0, score_start:score_end]
             bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
             bytes_np += (
                 has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
             ).astype(np.int16, copy=False)
             total_tokens += float(score_count)
             total_bytes += float(bytes_np.astype(np.float64).sum())
+            scored_until = w + score_end
             if log_fn is not None and total_batches > 1 and (
                 batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
             ):
                 log_fn(f"val_progress:{batch_idx}/{total_batches}")
 
+    val_loss = total_loss_sum / total_tokens
+    bits_per_token = val_loss / math.log(2.0)
+    val_bpb = bits_per_token * (total_tokens / total_bytes)
+    return val_loss, val_bpb
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model: GPT,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    chunk = max(1, min(args.ttt_chunk_size, args.train_seq_len))
+    n_tokens = val_tokens.size - 1
+    adapters = TTTAdapters(model, args.ttt_num_layers, args.ttt_rank, args.ttt_alpha)
+    adapter_opt = optim.AdamW(learning_rate=args.ttt_lr, betas=[0.9, 0.95], eps=args.adam_eps, weight_decay=0.0)
+    adapt_grad_fn = nn.value_and_grad(adapters, lambda x, y: model.loss(x, y, adapters=adapters))
+    total_loss_sum = 0.0
+    total_tokens = 0.0
+    total_bytes = 0.0
+    total_chunks = max((n_tokens + chunk - 1) // chunk, 1)
+    if log_fn is not None:
+        log_fn(f"ttt:enabled layers:{args.ttt_num_layers} rank:{args.ttt_rank} chunk:{chunk} steps:{args.ttt_steps} lr:{args.ttt_lr}")
+    for chunk_idx, score_start in enumerate(range(0, n_tokens, chunk), start=1):
+        if score_start > 0:
+            adapt_start = max(0, score_start - chunk)
+            adapt_chunk = val_tokens[adapt_start : score_start + 1]
+            x_adapt = mx.array(adapt_chunk[:-1][None, :], dtype=mx.int32)
+            y_adapt = mx.array(adapt_chunk[1:][None, :], dtype=mx.int32)
+            for _ in range(args.ttt_steps):
+                adapt_loss, adapt_grads = adapt_grad_fn(x_adapt, y_adapt)
+                adapt_grads = clip_grad_tree(adapt_grads, args.grad_clip_norm)
+                adapter_opt.learning_rate = args.ttt_lr
+                adapter_opt.update(adapters, adapt_grads)
+                mx.eval(adapt_loss, adapters.state, adapter_opt.state)
+        score_end = min(score_start + chunk, n_tokens)
+        window_start = max(0, score_end - args.train_seq_len)
+        window = val_tokens[window_start : score_end + 1]
+        x_np = window[:-1].reshape(1, -1)
+        y_np = window[1:].reshape(1, -1)
+        x = mx.array(x_np, dtype=mx.int32)
+        y = mx.array(y_np, dtype=mx.int32)
+        local_start = score_start - window_start
+        local_end = local_start + (score_end - score_start)
+        token_losses = model.token_losses(x, y, adapters=adapters).astype(mx.float32)
+        mx.eval(token_losses)
+        token_losses_np = _np_float32(token_losses).reshape(-1)
+        total_loss_sum += float(token_losses_np[local_start:local_end].astype(np.float64).sum())
+        prev_ids = x_np[0, local_start:local_end]
+        tgt_ids = y_np[0, local_start:local_end]
+        bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
+        bytes_np += (
+            has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+        ).astype(np.int16, copy=False)
+        total_tokens += float(local_end - local_start)
+        total_bytes += float(bytes_np.astype(np.float64).sum())
+        if log_fn is not None and total_chunks > 1 and (
+            chunk_idx == 1 or chunk_idx == total_chunks or chunk_idx % 50 == 0
+        ):
+            log_fn(f"ttt_progress:{chunk_idx}/{total_chunks}")
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
@@ -993,17 +1127,8 @@ def eval_val(
 def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     if max_norm <= 0:
         return grads_tree
-    flat = dict(tree_flatten(grads_tree))
-    total_sq = 0.0
-    for grad in flat.values():
-        total_sq += float(np.sum(np.square(_np_float32(grad)), dtype=np.float64))
-    if total_sq <= 0.0:
-        return grads_tree
-    total_norm = math.sqrt(total_sq)
-    if total_norm <= max_norm:
-        return grads_tree
-    scale = max_norm / (total_norm + 1e-12)
-    return tree_unflatten([(k, g * scale) for k, g in flat.items()])
+    clipped, _ = optim.clip_grad_norm(grads_tree, max_norm=max_norm)
+    return clipped
 
 
 def main() -> None:
@@ -1092,6 +1217,7 @@ def main() -> None:
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    compiled_token_losses = mx.compile(lambda x, y: model.token_losses(x, y), inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
         nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
         inputs=model.state,
@@ -1136,6 +1262,10 @@ def main() -> None:
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
+        f"ttt_enable:{args.ttt_enable} ttt_chunk_size:{args.ttt_chunk_size} "
+        f"ttt_num_layers:{args.ttt_num_layers} ttt_rank:{args.ttt_rank} ttt_steps:{args.ttt_steps}"
+    )
+    log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
@@ -1175,6 +1305,9 @@ def main() -> None:
         y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
         warm_val_loss = compiled_loss(x_val, y_val)
         mx.eval(warm_val_loss)
+        if 0 < args.eval_stride < args.train_seq_len:
+            warm_token_losses = compiled_token_losses(x_val[:1], y_val[:1])
+            mx.eval(warm_token_losses)
         mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, rank=rank, world_size=world_size)
@@ -1199,6 +1332,7 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args,
                 compiled_loss,
+                compiled_token_losses,
                 val_tokens,
                 base_bytes_lut,
                 has_leading_space_lut,
@@ -1323,15 +1457,27 @@ def main() -> None:
     quant_flat = dequantize_state_dict_mixed(pickle.loads(quant_decompressed), template_state)
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        log_fn=log,
-    )
+    if args.ttt_enable:
+        q_val_loss, q_val_bpb = eval_val_ttt(
+            args,
+            model,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            compiled_token_losses,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
