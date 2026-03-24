@@ -123,7 +123,7 @@ class Hyperparameters:
     ttt_num_layers: int = int(os.environ.get("TTT_NUM_LAYERS", 2))
     ttt_rank: int = int(os.environ.get("TTT_RANK", 8))
     ttt_alpha: float = float(os.environ.get("TTT_ALPHA", 16.0))
-    ttt_lr: float = float(os.environ.get("TTT_LR", 0.05))
+    ttt_lr: float = float(os.environ.get("TTT_LR", 0.005))
     ttt_steps: int = int(os.environ.get("TTT_STEPS", 1))
 
     # Optimizer.
@@ -621,22 +621,16 @@ class LinearLoRA(nn.Module):
     def __call__(self, hidden: mx.array) -> mx.array:
         z = hidden @ self.down.astype(hidden.dtype).T
         return (z @ self.up.astype(hidden.dtype).T) * self.scale.astype(hidden.dtype)
-
-
 class TTTAttnAdapters(nn.Module):
     def __init__(self, d: int, kv: int, rank: int, alpha: float):
         super().__init__()
         self.c_q = LinearLoRA(d, d, rank, alpha); self.c_k = LinearLoRA(d, kv, rank, alpha)
         self.c_v = LinearLoRA(d, kv, rank, alpha); self.proj = LinearLoRA(d, d, rank, alpha)
-
-
 class TTTMLPAdapters(nn.Module):
     def __init__(self, d: int, h: int, rank: int, alpha: float):
         super().__init__()
         self.w_gate = LinearLoRA(d, h, rank, alpha); self.w_up = LinearLoRA(d, h, rank, alpha)
         self.proj = LinearLoRA(h, d, rank, alpha)
-
-
 class TTTBlockAdapters(nn.Module):
     def __init__(self, block: Block, rank: int, alpha: float):
         super().__init__()
@@ -1086,10 +1080,15 @@ def eval_val_ttt(
             y_adapt = mx.array(adapt_chunk[1:][None, :], dtype=mx.int32)
             for _ in range(args.ttt_steps):
                 adapt_loss, adapt_grads = adapt_grad_fn(x_adapt, y_adapt)
-                adapt_grads = clip_grad_tree(adapt_grads, args.grad_clip_norm)
+                adapt_grads = clip_grad_tree(adapt_grads, min(args.grad_clip_norm, 0.1))
                 adapter_opt.learning_rate = args.ttt_lr
                 adapter_opt.update(adapters, adapt_grads)
                 mx.eval(adapt_loss, adapters.state, adapter_opt.state)
+                if not math.isfinite(float(adapt_loss.item())):
+                    adapters = TTTAdapters(model, args.ttt_num_layers, args.ttt_rank, args.ttt_alpha)
+                    adapter_opt = optim.AdamW(learning_rate=args.ttt_lr, betas=[0.9, 0.95], eps=args.adam_eps, weight_decay=0.0)
+                    adapt_grad_fn = nn.value_and_grad(adapters, lambda x, y: model.loss(x, y, adapters=adapters))
+                    break
         score_end = min(score_start + chunk, n_tokens)
         window_start = max(0, score_end - args.train_seq_len)
         window = val_tokens[window_start : score_end + 1]
@@ -1102,7 +1101,17 @@ def eval_val_ttt(
         token_losses = model.token_losses(x, y, adapters=adapters).astype(mx.float32)
         mx.eval(token_losses)
         token_losses_np = _np_float32(token_losses).reshape(-1)
-        total_loss_sum += float(token_losses_np[local_start:local_end].astype(np.float64).sum())
+        score_losses = token_losses_np[local_start:local_end]
+        if not np.isfinite(score_losses).all():
+            if log_fn is not None:
+                log_fn(f"ttt_nan_fallback:{chunk_idx}/{total_chunks}")
+            token_losses = model.token_losses(x, y).astype(mx.float32)
+            mx.eval(token_losses)
+            score_losses = _np_float32(token_losses).reshape(-1)[local_start:local_end]
+            adapters = TTTAdapters(model, args.ttt_num_layers, args.ttt_rank, args.ttt_alpha)
+            adapter_opt = optim.AdamW(learning_rate=args.ttt_lr, betas=[0.9, 0.95], eps=args.adam_eps, weight_decay=0.0)
+            adapt_grad_fn = nn.value_and_grad(adapters, lambda x, y: model.loss(x, y, adapters=adapters))
+        total_loss_sum += float(score_losses.astype(np.float64).sum())
         prev_ids = x_np[0, local_start:local_end]
         tgt_ids = y_np[0, local_start:local_end]
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
